@@ -23,6 +23,7 @@
  *   byte 1  0x80 at rest (flags/type)
  *   byte 2  buttons: bit0=Y bit1=X bit2=B bit3=A bit6=R bit7=ZR
  *   byte 3  buttons: bit0=Minus bit1=Plus bit2=SR bit3=SL bit4=Home
+ *                    bit5=Capture
  *   byte 4  D-pad:   bit0=Dwn bit1=Up bit2=Right bit3=Left
  *                    bit6=L    bit7=ZL
  *   byte 5  left stick X  low byte          \
@@ -89,26 +90,27 @@ static const __u8 nsl_sw001_rdesc[] = {
 
     /*
      * byte 3: buttons
-     *   bit0=Minus bit1=Plus bit2=SR bit3=SL bit4=Home
-     *   bits 5-7 unused (constant)
+     *   bit0=Minus bit1=Plus bit2=SR bit3=SL bit4=Home bit5=Capture
+     *   bits 6-7 unused (constant)
      *
      * usage -> keycode (gamepad base 0x130 + (N-1)):
      *   Minus=0x0b->BTN_SELECT  Plus=0x0c->BTN_START
      *   SR=0x0f->BTN_THUMBR     SL=0x0e->BTN_THUMBL
-     *   Home=0x0d->BTN_MODE
+     *   Home=0x0d->BTN_MODE     Capture=0x06->BTN_Z
      */
     0x09, 0x0b,       /* Usage (Minus) */
     0x09, 0x0c,       /* Usage (Plus) */
     0x09, 0x0f,       /* Usage (SR) */
     0x09, 0x0e,       /* Usage (SL) */
     0x09, 0x0d,       /* Usage (Home) */
+    0x09, 0x06,       /* Usage (Capture) */
     0x15, 0x00,
     0x25, 0x01,
     0x75, 0x01,
-    0x95, 0x05,
+    0x95, 0x06,
     0x81, 0x02,
     0x75, 0x01,
-    0x95, 0x03,
+    0x95, 0x02,
     0x81, 0x01,
 
     /*
@@ -164,12 +166,33 @@ static const __u8 nsl_sw001_rdesc[] = {
     0x81, 0x02,       /* Input (Data,Var,Abs) */
 
     /*
-     * bytes 11..47: 0x0a status byte + three 12-byte IMU samples,
-     * ignore.  bytes 11..47 = 37 bytes.
+     * bytes 11..47: 0x0a status byte + three 12-byte IMU samples
+     * (each sample = accel X/Y/Z, gyro X/Y/Z as int16 LE).
+     *
+     * Byte 11 (0x0a) and bytes 12..35 (samples 1-2) are ignored.
+     * Bytes 36..47 (newest sample) are declared as Sensor usages and
+     * mapped to EV_ABS axes by nsl_sw001_input_mapping():
+     *   absmisc+0=accU   absmisc+1=accY  absmisc+2=accZ
+     *   absmisc+3=gyroX  absmisc+4=gyroY absmisc+5=gyroZ
      */
     0x75, 0x08,       /* Report Size (8) */
-    0x95, 0x25,       /* Report Count (37) */
+    0x95, 0x01,       /* Report Count (1) */
+    0x81, 0x01,       /* Input (Const)      -- byte 11 status */
+    0x75, 0x08,
+    0x95, 0x18,       /* Report Count (24)  -- bytes 12..35 */
     0x81, 0x01,       /* Input (Const) */
+    0x05, 0x20,       /* Usage Page (Sensor) */
+    0x09, 0x73,       /* Usage (Accelerometer 3D) */
+    0x09, 0x73,       /* Usage (Accelerometer 3D) */
+    0x09, 0x73,       /* Usage (Accelerometer 3D) */
+    0x09, 0x76,       /* Usage (Gyrometer 3D) */
+    0x09, 0x76,       /* Usage (Gyrometer 3D) */
+    0x09, 0x76,       /* Usage (Gyrometer 3D) */
+    0x16, 0x00, 0x80, /* Logical Minimum (-32768) */
+    0x26, 0xff, 0x7f, /* Logical Maximum (32767) */
+    0x75, 0x10,       /* Report Size (16) */
+    0x95, 0x06,       /* Report Count (6) */
+    0x81, 0x02,       /* Input (Data,Var,Abs)  -- bytes 36..47 */
 
     0xc0,
 
@@ -252,6 +275,18 @@ static int nsl_sw001_input_mapping(struct hid_device *hdev,
     if (field->application != HID_GD_GAMEPAD)
         return 0;
 
+    /* Newest IMU sample (bytes 36..47): accel X/Y/Z then gyro X/Y/Z,
+     * 6x int16 declared as Sensor usages.  Expose them as extra EV_ABS
+     * axes (ABS_MISC + 0..5) so they are visible in evdev tools and can
+     * feed a userspace DSU / Cemuhook bridge (Cemu, Yuzu, Ryujinx).
+     */
+    if ((usage->hid & HID_USAGE_PAGE) == HID_UP_SENSOR) {
+        int idx = usage->usage_index;
+        if (idx < 6)
+            hid_map_usage(hidinput, usage, bit, max, EV_ABS, ABS_MISC + idx);
+        return 1;
+    }
+
     switch (usage->hid) {
     case HID_GD_UP:
         hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_DPAD_UP);
@@ -268,6 +303,26 @@ static int nsl_sw001_input_mapping(struct hid_device *hdev,
     default:
         return 0;
     }
+}
+
+/*
+ * hid-core's generic mapping gives EV_ABS axes in GAMEPAD applications a
+ * fuzz/flat derived from the logical range.  For the IMU axes (logical
+ * -32768..32767) that means fuzz=255 and flat=4095: input core suppresses
+ * any sample within ~4095 counts of center, i.e. all real gyro/accel data.
+ * Clear it so raw 16-bit samples reach userspace.
+ */
+static int nsl_sw001_input_configured(struct hid_device *hdev,
+                                       struct hid_input *hidinput)
+{
+    struct input_dev *input = hidinput->input;
+    int i;
+
+    for (i = 0; i < 6; i++) {
+        if (test_bit(ABS_MISC + i, input->absbit))
+            input_set_abs_params(input, ABS_MISC + i, -32768, 32767, 0, 0);
+    }
+    return 0;
 }
 
 static const __u8 *nsl_sw001_report_fixup(struct hid_device *hdev,
@@ -322,6 +377,7 @@ static struct hid_driver nsl_sw001_driver = {
     .probe = nsl_sw001_probe,
     .report_fixup = nsl_sw001_report_fixup,
     .input_mapping = nsl_sw001_input_mapping,
+    .input_configured = nsl_sw001_input_configured,
 };
 
 module_hid_driver(nsl_sw001_driver);
