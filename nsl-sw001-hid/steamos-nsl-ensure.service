@@ -1,0 +1,27 @@
+# SteamOS ensure service for the N-SL SW001 HID driver.
+#
+# Runs at boot to re-establish the driver after a SteamOS A/B update.  The
+# root partition (/usr) is fully replaced on update, wiping DKMS sources and
+# built modules, so this service re-seeds everything from a persistent copy
+# under /home and rebuilds for the current kernel.
+#
+# Enabled by the installer (and re-enabled by the ensure script itself, since
+# /etc and /usr may be fresh after an update).
+[Unit]
+Description=Ensure N-SL SW001 HID driver is built and loaded
+# Before the desktop session so the controller is ready in Game Mode.
+Before=systemd-user-sessions.service
+After=local-fs.target
+ConditionPathExists=/home/.steamos-nsl-sw001/steamos-nsl-ensure.sh
+
+[Service]
+Type=oneshot
+ExecStart=/home/.steamos-nsl-sw001/steamos-nsl-ensure.sh
+RemainAfterExit=yes
+TimeoutStartSec=600
+# Tmpfiles and udev may not be ready; keep us after they settle.
+After=systemd-udevd.service systemd-tmpfiles-setup.service
+RequiresMountsFor=/home
+
+[Install]
+WantedBy=multi-user.target
