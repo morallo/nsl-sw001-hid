@@ -288,6 +288,12 @@ static int nsl_sw001_input_mapping(struct hid_device *hdev,
     }
 
     switch (usage->hid) {
+    case 0x00090001:   /* Usage (A) -- Nintendo bottom face -> BTN_EAST */
+        hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_EAST);
+        return 1;
+    case 0x00090002:   /* Usage (B) -- Nintendo right face -> BTN_SOUTH */
+        hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_SOUTH);
+        return 1;
     case HID_GD_UP:
         hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_DPAD_UP);
         return 1;
