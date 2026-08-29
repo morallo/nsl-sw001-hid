@@ -331,6 +331,43 @@ static int nsl_sw001_input_configured(struct hid_device *hdev,
     return 0;
 }
 
+/*
+ * The controller reports the two analog Y axes with a reversed direction
+ * relative to the HID/evdev convention (pushing down drives the raw value
+ * toward 0, which hid-input would surface as the negative/-up extreme).
+ * Invert the two 12-bit Y fields here, before hid-input parses the field
+ * values, so that userspace sees the standard convention (down=+, up=-)
+ * with the rest still centered.  No SDL axis negation is then needed.
+ *
+ * Report layout (see header): data[0] is the report id (0x30) and the
+ * sticks are bit-packed 12-bit values over data[6..11]:
+ *   X  = data[6] | ((data[7] & 0x0f) << 8)
+ *   Y  = (data[7] >> 4) | (data[8] << 4)
+ *   Rx = data[9] | ((data[10] & 0x0f) << 8)
+ *   Ry = (data[10] >> 4) | (data[11] << 4)
+ */
+static int nsl_sw001_raw_event(struct hid_device *hdev,
+                               struct hid_report *report,
+                               u8 *data, int size)
+{
+    unsigned int y, ry;
+
+    if (report->id != 0x30 || size < 12)
+        return 0;
+
+    y = ((data[7] >> 4) | ((unsigned int)data[8] << 4)) & 0x0fff;
+    y = 0x0fff - y;
+    data[7] = (data[7] & 0x0f) | ((y & 0x0f) << 4);
+    data[8] = (y >> 4) & 0xff;
+
+    ry = ((data[10] >> 4) | ((unsigned int)data[11] << 4)) & 0x0fff;
+    ry = 0x0fff - ry;
+    data[10] = (data[10] & 0x0f) | ((ry & 0x0f) << 4);
+    data[11] = (ry >> 4) & 0xff;
+
+    return 0;
+}
+
 static const __u8 *nsl_sw001_report_fixup(struct hid_device *hdev,
                                           __u8 *rdesc,
                                           unsigned int *rsize)
@@ -382,6 +419,7 @@ static struct hid_driver nsl_sw001_driver = {
     .id_table = nsl_sw001_devices,
     .probe = nsl_sw001_probe,
     .report_fixup = nsl_sw001_report_fixup,
+    .raw_event = nsl_sw001_raw_event,
     .input_mapping = nsl_sw001_input_mapping,
     .input_configured = nsl_sw001_input_configured,
 };
