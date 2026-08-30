@@ -114,6 +114,15 @@ if [ -z "$MAJMIN" ] || [ "$MAJMIN" = "$KERNEL" ]; then
     die "could not derive SteamOS header package from kernel release '$KERNEL'"
 fi
 P="linux-neptune-${MAJMIN}-headers"
+
+# A fresh SteamOS install may not have an initialized pacman keyring; without
+# it pacman fails to verify packages ("keyring is not writable").  Initialize
+# and populate both Arch and Valve (holo) trust anchors first.
+log "initializing pacman keyring"
+run_root pacman-key --init >/dev/null 2>&1 || true
+run_root pacman-key --populate archlinux >/dev/null 2>&1 || true
+run_root pacman-key --populate holo >/dev/null 2>&1 || true
+
 log "installing headers package: $P"
 run_root pacman --noconfirm -S --needed dkms base-devel gcc make "$P"
 

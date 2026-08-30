@@ -68,6 +68,9 @@ if ! command -v dkms >/dev/null 2>&1; then
     if [ -z "$MAJMIN" ] || [ "$MAJMIN" = "$KERNEL" ]; then
         MAJMIN="616"
     fi
+    run_priv pacman-key --init >/dev/null 2>&1 || true
+    run_priv pacman-key --populate archlinux >/dev/null 2>&1 || true
+    run_priv pacman-key --populate holo >/dev/null 2>&1 || true
     run_priv pacman --noconfirm -S --needed dkms base-devel gcc make \
         "linux-neptune-${MAJMIN}-headers" || true
     refresh_readonly
