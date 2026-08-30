@@ -7,6 +7,19 @@
 #define USB_DEVICE_ID_PRO_CONTROLLER 0x2009
 
 /*
+ * OUI (first three bytes of the Bluetooth BD_ADDR) that identifies the
+ * N-SL SW001 clones.  It is an unregistered IEEE OUI block, shared by
+ * the whole family of SW001 units; each unit has its own MAC suffix.
+ * Genuine Nintendo controllers use Nintendo's registered OUIs, so keying
+ * on this prefix lets the driver claim only SW001 units (both of ours,
+ * and any other unit of the same model) without matching 057e:2009
+ * devices of other vendors.
+ */
+#define NSL_SW001_OUI0 0x9c
+#define NSL_SW001_OUI1 0x54
+#define NSL_SW001_OUI2 0x00
+
+/*
  * N-SL SW001 descriptor, rewritten to match the controller's real
  * Bluetooth HID input report (0x30).
  *
@@ -382,10 +395,57 @@ static const __u8 *nsl_sw001_report_fixup(struct hid_device *hdev,
     return nsl_sw001_rdesc;
 }
 
+/*
+ * Parse the Bluetooth BD_ADDR from hdev->uniq (set by hidp to the remote
+ * address, e.g. "9C:54:00:4B:8F:A7" via %pMR) and return true if it belongs
+ * to the N-SL SW001 OUI block.
+ */
+static bool nsl_sw001_matches_oui(struct hid_device *hdev)
+{
+    unsigned long byte;
+    int i, parsed = 0;
+    const char *s = hdev->uniq;
+
+    if (!s || !*s)
+        return false;
+
+    for (i = 0; i < 6 && *s; i++) {
+        byte = simple_strtoul(s, NULL, 16);
+        if (byte > 0xff)
+            return false;
+
+        if (i == 0 && byte != NSL_SW001_OUI0)
+            return false;
+        if (i == 1 && byte != NSL_SW001_OUI1)
+            return false;
+        if (i == 2 && byte != NSL_SW001_OUI2)
+            return false;
+
+        parsed++;
+        while (*s && *s != ':')
+            s++;
+        if (*s == ':')
+            s++;
+    }
+
+    return parsed == 6;
+}
+
 static int nsl_sw001_probe(struct hid_device *hdev,
                            const struct hid_device_id *id)
 {
     int ret;
+
+    /*
+     * The id_table matches any 057e:2009 Bluetooth device, but not all of
+     * them are N-SL SW001 units.  Only claim devices whose Bluetooth MAC
+     * starts with the SW001 OUI (9C:54:00); return -ENODEV so the core
+     * falls through to the next driver for everything else.
+     */
+    if (!nsl_sw001_matches_oui(hdev)) {
+        hid_info(hdev, "N-SL SW001: not a 9C:54:00 OUI device, skipping\n");
+        return -ENODEV;
+    }
 
     hdev->quirks |= HID_QUIRK_INPUT_PER_APP;
 
@@ -427,5 +487,5 @@ static struct hid_driver nsl_sw001_driver = {
 module_hid_driver(nsl_sw001_driver);
 
 MODULE_DESCRIPTION("HID quirk for N-SL SW001 Nintendo-style controller");
-MODULE_AUTHOR("Test driver");
+MODULE_AUTHOR("morallo with OpenCode");
 MODULE_LICENSE("GPL");
