@@ -138,6 +138,8 @@ run_root chown -R root:root "$SRC_DIR"
 
 # --- 3. DKMS build/install ----------------------------------------------------
 log "building DKMS module"
+# Idempotent: clear any previous DKMS entry (source may have been replaced).
+run_root dkms remove "$PKG_NAME/$PKG_VERSION" --all >/dev/null 2>&1 || true
 run_root dkms add "$SRC_DIR" >/dev/null
 run_root dkms build -m "$PKG_NAME" -v "$PKG_VERSION" -k "$KERNEL"
 run_root dkms install -m "$PKG_NAME" -v "$PKG_VERSION" -k "$KERNEL"

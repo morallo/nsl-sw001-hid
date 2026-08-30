@@ -88,6 +88,9 @@ fi
 # --- 3. Build & install the module for the running kernel --------------------
 if command -v dkms >/dev/null 2>&1; then
     log "building $PKG for kernel $KERNEL"
+    # Idempotent: clear any previous DKMS entry first.
+    run_priv dkms remove -m "$(echo "$PKG" | cut -d/ -f1)" \
+        -v "$(echo "$PKG" | cut -d/ -f2)" --all >/dev/null 2>&1 || true
     run_priv dkms add "$SRC_DIR" >/dev/null 2>&1 || true
     run_priv dkms build -m "$(echo "$PKG" | cut -d/ -f1)" -v "$(echo "$PKG" | cut -d/ -f2)" -k "$KERNEL" || true
     run_priv dkms install -m "$(echo "$PKG" | cut -d/ -f1)" -v "$(echo "$PKG" | cut -d/ -f2)" -k "$KERNEL" || true
