@@ -124,6 +124,13 @@ run_priv cp "$SEED/etc/steamos-nsl-ensure.service" \
 run_priv systemctl daemon-reload
 run_priv systemctl enable steamos-nsl-ensure.service >/dev/null 2>&1 || true
 
+# /etc/environment SDL vars (for Game Mode): re-append if an update dropped
+# them despite the keep-list.
+if ! grep -q "nsl-sw001" /etc/environment 2>/dev/null; then
+    log "re-asserting SDL vars in /etc/environment"
+    run_priv sh -c "cat '$SEED/etc/environment-system-append.conf' >> /etc/environment"
+fi
+
 # --- 5. Load driver ----------------------------------------------------------
 log "loading $DRIVER"
 run_priv modprobe "$DRIVER" || true

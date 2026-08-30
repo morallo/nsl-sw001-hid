@@ -71,6 +71,8 @@ uninstall() {
     run_root systemctl daemon-reload
     run_root systemctl disable steamos-nsl-ensure.service >/dev/null 2>&1 || true
     run_root rm -f /etc/atomic-update.conf.d/nsl-sw001.conf
+    run_root sed -i '/# N-SL SW001 (added by install-nsl-sw001-deck.sh/,/^# end nsl-sw001/d' \
+        /etc/environment 2>/dev/null || true
     run_root rmmod "$DRIVER" >/dev/null 2>&1 || true
     rm -rf "$SEED"
 
@@ -157,6 +159,7 @@ run_root cp "$SCRIPT_DIR/blacklist-hid-nintendo.conf"          "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/modules-load-nsl-sw001.conf"           "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/atomic-update-additional-keep-list.conf" "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/steamos-nsl-ensure.service"            "$SEED/etc/"
+run_root cp "$SCRIPT_DIR/environment-system-append.conf"         "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/steamos-nsl-ensure.sh"                 "$SEED/steamos-nsl-ensure.sh"
 run_root chmod +x "$SEED/steamos-nsl-ensure.sh"
 run_root chown -R root:root "$SEED"
@@ -170,15 +173,32 @@ log "installing atomic-update keep-list"
 run_root mkdir -p /etc/atomic-update.conf.d
 run_root cp "$SCRIPT_DIR/atomic-update-additional-keep-list.conf" /etc/atomic-update.conf.d/nsl-sw001.conf
 
-# --- 6. SDL/Steam environment (global) ----------------------------------------
+# --- 6. SDL/Steam environment ------------------------------------------------
+# SteamOS Game Mode does NOT apply ~/.config/environment.d to the Steam
+# session, so Desktop Mode works but Game Mode doesn't.  The vars must be
+# system-wide in /etc/environment (sourced by PAM for both Game Mode and
+# Desktop Mode sessions).  Append idempotently using a marker.
+ENV_FRAG="$SCRIPT_DIR/environment-system-append.conf"
+log "appending SDL vars to /etc/environment (reaches Game Mode too)"
+if ! grep -q "nsl-sw001" /etc/environment 2>/dev/null; then
+    run_root cp /etc/environment /etc/environment.bak-nsl-sw001
+    run_root sh -c "cat '$ENV_FRAG' >> /etc/environment"
+else
+    log "/etc/environment already contains nsl-sw001 entries; updating in place"
+    run_root sed -i '/# N-SL SW001 (added by install-nsl-sw001-deck.sh/,/^# end nsl-sw001/d' /etc/environment
+    run_root sh -c "cat '$ENV_FRAG' >> /etc/environment"
+fi
+
+# Keep the per-user environment.d too (harmless; covers Desktop Mode even
+# without the login-time /etc/environment source, and documents the values).
 USERDIR=""
 if [ -n "${SUDO_USER:-}" ]; then
     USERDIR="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
 else
     USERDIR="$HOME"
 fi
-log "installing SDL environment for user $USERDIR"
 if [ -n "$USERDIR" ] && [ -d "$USERDIR" ]; then
+    log "also writing per-user environment.d for $USERDIR"
     run_root mkdir -p "$USERDIR/.config/environment.d"
     run_root cp "$SCRIPT_DIR/environment-nsl-sw001.conf" "$USERDIR/.config/environment.d/nsl-sw001.conf"
     if [ -n "${SUDO_USER:-}" ]; then

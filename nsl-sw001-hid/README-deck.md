@@ -12,7 +12,10 @@ installed and working on the Deck. No IMU/gyro work is included yet.
   matches 057e:2009 but can't speak Nintendo's protocol, times out with -110
   and never releases the device).
 - Installs the SDL/Steam Input environment so Steam sees the controller
-  correctly (via `~/.config/environment.d/nsl-sw001.conf`).
+  correctly.  The `SDL_*` vars are appended to **`/etc/environment`** so they
+  reach Steam in **both** Game Mode and Desktop Mode (Game Mode ignores
+  `~/.config/environment.d/`), plus a per-user `environment.d` copy for
+  Desktop Mode.
 - Re-enables the read-only rootfs after install.
 - Survives SteamOS A/B updates via a self-seeding ensure service.
 
@@ -26,8 +29,9 @@ installed and working on the Deck. No IMU/gyro work is included yet.
 | `steamos-nsl-ensure.service` | systemd unit that runs it at boot |
 | `blacklist-hid-nintendo.conf` | Global modprobe blacklist of `hid_nintendo` |
 | `modules-load-nsl-sw001.conf` | Load `hid-nsl-sw001` at boot |
-| `atomic-update-additional-keep-list.conf` | Makes `hid_nintendo` blacklist + unit survive SteamOS updates |
-| `environment-nsl-sw001.conf` | `SDL_HIDAPI_IGNORE_DEVICES` + `SDL_GAMECONTROLLERCONFIG` |
+| `atomic-update-additional-keep-list.conf` | Makes `hid_nintendo` blacklist + unit + `/etc/environment` survive SteamOS updates |
+| `environment-nsl-sw001.conf` | Per-user `SDL_HIDAPI_IGNORE_DEVICES` + `SDL_GAMECONTROLLERCONFIG` (Desktop Mode) |
+| `environment-system-append.conf` | System-wide SDL vars appended to `/etc/environment` (Game Mode + Desktop Mode) |
 | `README-deck.md` | This file |
 
 ## Install
