@@ -101,13 +101,20 @@ log "SteamOS installer for $PKG_NAME $PKG_VERSION (kernel $KERNEL)"
 run_root steamos-readonly disable
 
 # --- 1. Dependencies: dkms + build tools + matching headers ------------------
-# Valve bug: the linux-neptune headers package can lag the running kernel's
-# valveXX number.  Install the package matching the running kernel.
+# SteamOS kernel packages are named linux-neptune-<majmin>-... where <majmin>
+# is the kernel major+minor (e.g. 6.16 -> 616).  The uname release is
+# 6.16.12-valve24.5-1-neptune-616-g<githash>; the headers package matching the
+# running kernel is linux-neptune-616-headers.  Valve bug: this package can lag
+# the running kernel's valveXX number, so always target the one for the running
+# kernel.
 log "installing build dependencies"
-P="linux-neptune-$(echo "$KERNEL" | sed -E 's/-valve[0-9]+$//')-headers"
-if pacman -Qq "linux-neptune-headers" >/dev/null 2>&1; then
-    P="linux-neptune-headers"
+# Extract the "-neptune-<majmin>-" token from the uname release.
+MAJMIN="$(echo "$KERNEL" | sed -E 's/.*-neptune-([0-9]+)-.*/\1/')"
+if [ -z "$MAJMIN" ] || [ "$MAJMIN" = "$KERNEL" ]; then
+    die "could not derive SteamOS header package from kernel release '$KERNEL'"
 fi
+P="linux-neptune-${MAJMIN}-headers"
+log "installing headers package: $P"
 run_root pacman --noconfirm -S --needed dkms base-devel gcc make "$P"
 
 # --- 2. Stage source + dkms.conf under /usr/src ------------------------------

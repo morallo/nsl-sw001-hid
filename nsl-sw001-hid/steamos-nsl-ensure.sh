@@ -57,20 +57,19 @@ refresh_readonly
 trap 'RO' EXIT
 
 # --- 1. Install / ensure matching kernel headers -----------------------------
-# Valve bug: the linux-neptune headers package can lag the running kernel's
-# valveXX number, so a plain package install may not match the running kernel.
-# Ensure dkms + tools exist and the headers package matching uname is present.
+# SteamOS kernel packages are named linux-neptune-<majmin>-headers where majmin
+# is kernel major+minor (6.16 -> 616), matching the "-neptune-616-" token in
+# the uname release.  Ensure dkms + tools exist and that package is present.
 KERNEL="$(uname -r)"
 if ! command -v dkms >/dev/null 2>&1; then
-    log "installing dkms-based deps"
-    READONLY_BEFORE=1
+    log "installing dkms and build dependencies"
     refresh_readonly
-    if pacman -Qq "linux-neptune-headers" >/dev/null 2>&1; then
-        P="linux-neptune-headers"
-    else
-        P="linux-neptune-$(echo "$KERNEL" | sed -E 's/-valve[0-9]+$//')-headers"
+    MAJMIN="$(echo "$KERNEL" | sed -E 's/.*-neptune-([0-9]+)-.*/\1/')"
+    if [ -z "$MAJMIN" ] || [ "$MAJMIN" = "$KERNEL" ]; then
+        MAJMIN="616"
     fi
-    run_priv pacman --noconfirm -S --needed dkms base-devel gcc make "$P" || true
+    run_priv pacman --noconfirm -S --needed dkms base-devel gcc make \
+        "linux-neptune-${MAJMIN}-headers" || true
     refresh_readonly
 fi
 
