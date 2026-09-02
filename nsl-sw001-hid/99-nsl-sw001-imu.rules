@@ -1,0 +1,5 @@
+# Grant the logged-in user access to the N-SL SW001 IMU evdev node.
+# The gamepad joystick node gets a uaccess ACL via Steam's rules, but the
+# separate "Pro Controller IMU" input node does not, leaving SDL unable to
+# open it (EACCES), so SDL_GamepadHasSensor(ACCEL/GYRO) is always false.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pro Controller IMU", TAG+="uaccess"

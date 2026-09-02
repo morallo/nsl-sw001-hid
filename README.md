@@ -29,11 +29,12 @@ integration) that fixes that.
   - **maps every button, stick, trigger and the D-pad** to standard evdev
     codes, with A/B mapped by *physical position* (south=south, east=east, like
     the stick labels) — expect Xbox-native games to show A/B swapped;
-  - **exposes the IMU** (accelerometer + gyroscope) as six extra `EV_ABS` axes
-    (`ABS_MISC + 0..5`) on the gamepad node, usable through evdev or a
-    userspace DSU/Cemuhook bridge (Cemu, Yuzu, Ryujinx).
+  - **exposes the IMU** (accelerometer + gyroscope) as a **separate evdev
+    sensor device** ("Pro Controller IMU", accel on `ABS_X/Y/Z`, gyro on
+    `ABS_RX/RY/RZ`, with `INPUT_PROP_ACCELEROMETER`) so SDL's Linux sensor
+    backend exposes `SDL_SENSOR_ACCEL/GYRO` and Steam Input can use the gyro;
 - Blacklists the broken `hid-nintendo` match so the SW001 is not stolen from
-  the new driver.
+  the new driver.  
   ⚠️⚠️⚠️ THIS WILL PREVENT YOUR GENUINE NINTENDO CONTROLLERS FROM WORKING!!! ⚠️⚠️⚠️
 - Provides SDL 3 / Steam Input integration via:
   - `SDL_HIDAPI_IGNORE_DEVICES=0x057e/0x2009` — exclude only the SW001 from
@@ -53,8 +54,10 @@ integration) that fixes that.
 │   ├── dkms.conf                        DKMS packaging (auto-rebuild on kernel update)
 │   ├── blacklist-hid-nintendo.conf      modprobe blacklist for hid_nintendo
 │   ├── modules-load-nsl-sw001.conf      load hid-nsl-sw001 at boot
+│   ├── 99-nsl-sw001-imu.rules           udev rule granting IMU node access (REQUIRED for gyro)
 │   ├── nsl-sw001-controllersdb.txt      SDL gamecontrollerdb entry
 │   ├── steam-nsl-shim.sh                launch Steam with the SDL vars set
+│   ├── live_sensor.c                    SDL3 sensor test (SDL_GamepadHasSensor)
 │   ├── install-nsl-sw001-deck.sh        Steam Deck installer
 │   ├── steamos-nsl-ensure.{sh,service}  boot-time rebuild after SteamOS updates
 │   ├── environment-*.conf               SDL env vars (system + per-user)
@@ -66,8 +69,8 @@ integration) that fixes that.
 ```
 
 `nsl-sw001-hid/` also contains small SDL 3 diagnostics tools (`enum_sdl3`,
-`live_sdl3`, `live_gamepad`, `oneshot_raw`) and `watch_controller.py` for
-testing the setup.
+`live_sdl3`, `live_gamepad`, `oneshot_raw`, `live_sensor` for IMU/sensor
+checks) and `watch_controller.py` for testing the setup.
 
 ## Supported hardware
 
@@ -124,11 +127,19 @@ sudo dkms add -m nsl-sw001-hid -v 1.0
 sudo dkms build -m nsl-sw001-hid -v 1.0
 sudo dkms install -m nsl-sw001-hid -v 1.0
 
-# 3. Keep hid-nintendo away from the SW001, and load our driver at boot
+# 4. Grant your user access to the IMU node (REQUIRED for gyro/accel in
+#    SDL/Steam Input).  The main gamepad node gets a uaccess ACL from Steam's
+#    rules, but the separate "Pro Controller IMU" input node does not, so
+#    SDL can't open it and Steam Input shows no gyro:
+sudo cp 99-nsl-sw001-imu.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+# disconnect + reconnect the controller (or: sudo udevadm trigger /sys/class/input/eventN)
+
+# 5. Keep hid-nintendo away from the SW001, and load our driver at boot
 sudo cp blacklist-hid-nintendo.conf /etc/modprobe.d/
 sudo cp modules-load-nsl-sw001.conf  /etc/modules-load.d/
 
-# 4. Load it now (or reboot)
+# 6. Load it now (or reboot)
 sudo modprobe hid-nsl-sw001
 ```
 
@@ -173,6 +184,8 @@ What the installer does (details in `README-deck.md`):
 
 - Builds and installs the driver via **DKMS** against the exact running kernel.
 - **Globally blacklists `hid_nintendo`** so it stops claiming the SW001.
+- Installs the **IMU uaccess udev rule** (`99-nsl-sw001-imu.rules`, REQUIRED
+  for gyro/accel in Steam Input) and seeds it so it survives SteamOS updates.
 - Writes the SDL vars into **`/etc/environment`** so they reach Steam in **both
   Game Mode and Desktop Mode** (Game Mode ignores `~/.config/environment.d/`).
 - Seeds a persistent copy under `/home/.steamos-nsl-sw001/` and installs a
@@ -197,6 +210,13 @@ cat /sys/bus/hid/devices/0005:057E:2009.*/uniq
 evtest
 # SDL-level test (SDL3 required):
 ./nsl-sw001-hid/live_sdl3
+# IMU/sensor test (SDL3 required; run with the SDL vars set, e.g. via the shim):
+SDL_HIDAPI_IGNORE_DEVICES="0x057e/0x2009" \
+SDL_GAMECONTROLLERCONFIG="$(cat nsl-sw001-hid/nsl-sw001-controllersdb.txt)" \
+./nsl-sw001-hid/live_sensor
+#   -> should print "ACCEL: present" and "GYRO: present" and live values.
+#   If it prints "not present", the udev rule isn't active: reconnect the
+#   controller or run: sudo udevadm trigger /sys/class/input/eventN
 ```
 
 ## Known limitations
@@ -207,11 +227,12 @@ evtest
 - **`SDL_HIDAPI_IGNORE_DEVICES` is strictly VID/PID based** (`057e/0x2009`), so
   a genuine Pro Controller on the same machine also falls back to evdev and
   loses its HIDAPI gyro/rumble.
-- **IMU speed/sensors:** the accelerometer and gyroscope are exposed as
-  `ABS_MISC+0..5` on the main gamepad node (shown in `evtest`). SDL's Linux
-  evdev sensor backend does **not** read those axes, so **Steam Input / SDL do
-  not currently surface gyro/accel** — use the axes directly (evdev) or a
-  userspace DSU/Cemuhook bridge (Cemu, Yuzu, Ryujinx). See `nsl_sw001_IMU.md`.
+- **IMU needs the udev rule:** the accelerometer/gyroscope are exposed as a
+  separate evdev sensor device ("Pro Controller IMU"). Without the
+  `99-nsl-sw001-imu.rules` udev rule (or being in the `input` group), SDL can't
+  open that node and `SDL_GamepadHasSensor` / Steam Input gyro are unavailable.
+  With the rule installed, gyro/accel work in SDL and Steam Input. See the
+  install steps above.
 - **A/B physical mapping:** because A/B are mapped to their physical positions
   (south/east), Xbox-native games display them swapped.
 - **Steam Deck Game Mode D-pad:** the D-pad fires correctly at the evdev level,

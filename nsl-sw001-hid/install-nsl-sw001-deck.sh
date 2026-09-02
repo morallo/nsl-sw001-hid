@@ -6,10 +6,12 @@
 #   1. Validates we are on SteamOS and requires sudo (or running as root).
 #   2. Builds and installs the driver via DKMS against the exact running kernel.
 #   3. Installs the global hid-nintendo blacklist + modules-load conf.
-#   4. Seeds a persistent copy under /home/.steamos-nsl-sw001/ and installs
+#   4. Installs the IMU udev rule (grants the logged-in user access to the
+#      separate "Pro Controller IMU" evdev node so SDL/Steam Input read gyro).
+#   5. Seeds a persistent copy under /home/.steamos-nsl-sw001/ and installs
 #      the ensure service + atomic-update keep-list so it survives A/B updates.
-#   5. Re-enables the read-only rootfs (unless --keep-writable).
-#   6. Installs the SDL environment for Steam Input (global environment.d).
+#   6. Re-enables the read-only rootfs (unless --keep-writable).
+#   7. Installs the SDL environment for Steam Input (global environment.d).
 #
 # Usage:
 #   ./install-nsl-sw001-deck.sh [--keep-writable] [--uninstall]
@@ -18,7 +20,10 @@
 #   - The global hid-nintendo blacklist disables genuine Pro Controllers too.
 #     That is acceptable for the current use (no genuine controllers).  See
 #     README-deck.md for the per-device alternative.
-#   - No IMU/gyro work is included in this step.
+#   - The IMU udev rule is REQUIRED for gyro/accel: the gamepad node gets a
+#     uaccess ACL from Steam's rules, but the separate "Pro Controller IMU"
+#     input node does not, so SDL can't open it (EACCES) and Steam Input shows
+#     no gyro.  See README-deck.md.
 
 set -euo pipefail
 
@@ -67,6 +72,8 @@ uninstall() {
     run_root rm -rf "$SRC_DIR"
     run_root rm -f /etc/modprobe.d/blacklist-hid-nintendo.conf
     run_root rm -f /etc/modules-load.d/nsl-sw001.conf
+    run_root rm -f /etc/udev/rules.d/99-nsl-sw001-imu.rules
+    run_root udevadm control --reload 2>/dev/null || true
     run_root rm -f /etc/systemd/system/steamos-nsl-ensure.service
     run_root systemctl daemon-reload
     run_root systemctl disable steamos-nsl-ensure.service >/dev/null 2>&1 || true
@@ -150,6 +157,15 @@ run_root mkdir -p /etc/modprobe.d /etc/modules-load.d
 run_root cp "$SCRIPT_DIR/blacklist-hid-nintendo.conf" /etc/modprobe.d/blacklist-hid-nintendo.conf
 run_root cp "$SCRIPT_DIR/modules-load-nsl-sw001.conf"  /etc/modules-load.d/nsl-sw001.conf
 
+# IMU udev rule: without this, SDL/Steam Input cannot read the IMU.  The main
+# gamepad node receives a uaccess ACL via Steam's udev rules, but the separate
+# "Pro Controller IMU" input node (created by the driver) does not, so SDL's
+# open() on it fails with EACCES and the gyro/accel never surface.
+log "installing IMU uaccess udev rule"
+run_root mkdir -p /etc/udev/rules.d
+run_root cp "$SCRIPT_DIR/99-nsl-sw001-imu.rules" /etc/udev/rules.d/99-nsl-sw001-imu.rules
+run_root udevadm control --reload || true
+
 # --- 5. Persistent seed + ensure service (survives A/B updates) --------------
 log "seeding persistent copy under $SEED"
 if [ -d "$SEED" ]; then run_root rm -rf "$SEED"; fi
@@ -159,6 +175,7 @@ run_root cp "$SCRIPT_DIR"/hid-nsl-sw001.c "$SCRIPT_DIR"/Makefile "$SCRIPT_DIR"/d
 # Config/unit templates to re-assert:
 run_root cp "$SCRIPT_DIR/blacklist-hid-nintendo.conf"          "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/modules-load-nsl-sw001.conf"           "$SEED/etc/"
+run_root cp "$SCRIPT_DIR/99-nsl-sw001-imu.rules"                "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/atomic-update-additional-keep-list.conf" "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/steamos-nsl-ensure.service"            "$SEED/etc/"
 run_root cp "$SCRIPT_DIR/environment-system-append.conf"         "$SEED/etc/"
@@ -175,7 +192,7 @@ log "installing atomic-update keep-list"
 run_root mkdir -p /etc/atomic-update.conf.d
 run_root cp "$SCRIPT_DIR/atomic-update-additional-keep-list.conf" /etc/atomic-update.conf.d/nsl-sw001.conf
 
-# --- 6. SDL/Steam environment ------------------------------------------------
+# --- 7. SDL/Steam environment ------------------------------------------------
 # SteamOS Game Mode does NOT apply ~/.config/environment.d to the Steam
 # session, so Desktop Mode works but Game Mode doesn't.  The vars must be
 # system-wide in /etc/environment (sourced by PAM for both Game Mode and
@@ -208,7 +225,7 @@ if [ -n "$USERDIR" ] && [ -d "$USERDIR" ]; then
     fi
 fi
 
-# --- 7. Load now, re-enable readonly ------------------------------------------
+# --- 8. Load now, re-enable readonly ------------------------------------------
 log "loading $DRIVER"
 run_root modprobe "$DRIVER" || true
 

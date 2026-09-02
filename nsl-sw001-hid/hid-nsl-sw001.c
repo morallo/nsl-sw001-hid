@@ -2,6 +2,8 @@
 
 #include <linux/hid.h>
 #include <linux/module.h>
+#include <linux/input.h>
+#include <linux/unaligned.h>
 
 #define USB_VENDOR_ID_NINTENDO 0x057e
 #define USB_DEVICE_ID_PRO_CONTROLLER 0x2009
@@ -51,6 +53,28 @@
  * The 12-bit stick packing means byte 6/9 share 4 bits between the two
  * axes, which the 4 x 12-bit field below maps natively.
  */
+
+/*
+ * IMU axis ranges/resolutions, matching upstream hid-nintendo
+ * (drivers/hid/hid-nintendo.c).  The reported values are raw/uncalibrated
+ * 16-bit samples but are normalized to these advertised resolutions so
+ * SDL's evdev sensor backend can scale them to physical units.
+ */
+#define NSL_IMU_MAX_ACCEL_MAG   32767
+#define NSL_IMU_ACCEL_RES_PER_G 4096    /* counts per G */
+#define NSL_IMU_MAX_GYRO_MAG     32767000 /* (2^16-1)*1000 */
+#define NSL_IMU_GYRO_RES_PER_DPS 14247   /* (14.247*1000) counts per deg/s */
+#define NSL_IMU_FUZZ             10
+
+struct nsl_sw001_data {
+    /* Separate IMU input device (accel ABS_X/Y/Z, gyro ABS_RX/RY/RZ) */
+    struct input_dev *imu_dev;
+    /* Gamepad input device (from hid-input), used for the D-pad hat */
+    struct input_dev *gamepad_dev;
+    /* Synthetic per-report timestamp counter (us) for MSC_TIMESTAMP */
+    s64 imu_timestamp_us;
+};
+
 static const __u8 nsl_sw001_rdesc[] = {
     0x05, 0x01,       /* Usage Page (Generic Desktop) */
     0x09, 0x05,       /* Usage (Game Pad) */
@@ -75,9 +99,11 @@ static const __u8 nsl_sw001_rdesc[] = {
      *
      * NOTE: under a Game Pad application collection, hid-input maps
      * Button-page usage N to code ((N-1) & 0xff) + BTN_GAMEPAD, i.e.
-     * 0x130 + (N-1).  Usage values below are chosen accordingly:
+     * 0x130 + (N-1).  Usage values below are chosen accordingly; the
+     * physical A (right face) resolves to BTN_EAST and the physical B
+     * (bottom face) to BTN_SOUTH, the physically-correct codes:
      *   Y=0x05->BTN_WEST      X=0x04->BTN_NORTH
-     *   B=0x02->BTN_EAST      A=0x01->BTN_SOUTH
+     *   B=0x02->BTN_SOUTH     A=0x01->BTN_EAST
      *   R=0x08->BTN_TR        ZR=0x0a->BTN_TR2
      */
     0x05, 0x09,       /* Usage Page (Button) */
@@ -132,26 +158,23 @@ static const __u8 nsl_sw001_rdesc[] = {
      *   bits 4-5 unused (constant)
      *   bit6=L -> BTN_TL   bit7=ZL -> BTN_TL2
      *
-     * D-pad directions are declared as Generic Desktop usages
-     * (0x91/0x90/0x92/0x93) but BLOCKED from the broken generic
-     * 1-bit hat path by input_mapping, which remaps each 1-bit
-     * direction to BTN_DPAD_*.  See nsl_sw001_input_mapping().
+     * The four D-pad direction bits are declared CONST so hid-input does
+     * not turn them into separate BTN_DPAD_* buttons (which hid-nintendo
+     * does not expose and Steam cannot read on its Switch Pro profile).
+     * Instead the axes ABX_HAT0X/HAT0Y are registered on the gamepad node
+     * (see input_configured) and emitted here from the raw direction bits,
+     * matching how hid-nintendo reports a genuine Pro Controller's D-pad
+     * as an 8-way hat switch that Steam maps to dpup/dpdown/dpleft/dpright.
      *
      * L/ZL usages (gamepad base):  L=0x07->BTN_TL, ZL=0x09->BTN_TL2
      */
     0x05, 0x01,       /* Usage Page (Generic Desktop) */
-    0x09, 0x91,       /* Usage (D-pad Down) */
-    0x09, 0x90,       /* Usage (D-pad Up) */
-    0x09, 0x92,       /* Usage (D-pad Right) */
-    0x09, 0x93,       /* Usage (D-pad Left) */
-    0x15, 0x00,
-    0x25, 0x01,
-    0x75, 0x01,
-    0x95, 0x04,
-    0x81, 0x02,
+    0x75, 0x04,
+    0x95, 0x01,
+    0x81, 0x01,       /* Input (Const) -- 4 D-pad bits (hat, handled below) */
     0x75, 0x01,
     0x95, 0x02,
-    0x81, 0x01,
+    0x81, 0x01,       /* Input (Const) -- bits 4-5 */
     0x05, 0x09,       /* Usage Page (Button) */
     0x09, 0x07,       /* Usage (L) */
     0x09, 0x09,       /* Usage (ZL) */
@@ -182,103 +205,30 @@ static const __u8 nsl_sw001_rdesc[] = {
      * bytes 11..47: 0x0a status byte + three 12-byte IMU samples
      * (each sample = accel X/Y/Z, gyro X/Y/Z as int16 LE).
      *
-     * Byte 11 (0x0a) and bytes 12..35 (samples 1-2) are ignored.
-     * Bytes 36..47 (newest sample) are declared as Sensor usages and
-     * mapped to EV_ABS axes by nsl_sw001_input_mapping():
-     *   absmisc+0=accU   absmisc+1=accY  absmisc+2=accZ
-     *   absmisc+3=gyroX  absmisc+4=gyroY absmisc+5=gyroZ
+     * Byte 11 (0x0a) and bytes 12..47 (all three IMU samples) are
+     * ignored by HID core here: the newest sample (bytes 36..47) is
+     * instead parsed in nsl_sw001_raw_event() and reported to the
+     * separate IMU input device (accel ABS_X/Y/Z, gyro ABS_RX/RY/RZ),
+     * matching how hid-nintendo / hid-sony expose it.
      */
     0x75, 0x08,       /* Report Size (8) */
     0x95, 0x01,       /* Report Count (1) */
     0x81, 0x01,       /* Input (Const)      -- byte 11 status */
     0x75, 0x08,
-    0x95, 0x18,       /* Report Count (24)  -- bytes 12..35 */
+    0x95, 0x24,       /* Report Count (36)  -- bytes 12..47 */
     0x81, 0x01,       /* Input (Const) */
-    0x05, 0x20,       /* Usage Page (Sensor) */
-    0x09, 0x73,       /* Usage (Accelerometer 3D) */
-    0x09, 0x73,       /* Usage (Accelerometer 3D) */
-    0x09, 0x73,       /* Usage (Accelerometer 3D) */
-    0x09, 0x76,       /* Usage (Gyrometer 3D) */
-    0x09, 0x76,       /* Usage (Gyrometer 3D) */
-    0x09, 0x76,       /* Usage (Gyrometer 3D) */
-    0x16, 0x00, 0x80, /* Logical Minimum (-32768) */
-    0x26, 0xff, 0x7f, /* Logical Maximum (32767) */
-    0x75, 0x10,       /* Report Size (16) */
-    0x95, 0x06,       /* Report Count (6) */
-    0x81, 0x02,       /* Input (Data,Var,Abs)  -- bytes 36..47 */
 
     0xc0,
 
     /*
-     * Original mouse collection (report id 0x02), unchanged.
+     * The original consumer-control and mouse collections are deliberately
+     * omitted: the SW001 never sends those reports (it only emits report
+     * ID 0x30), and leaving them in makes hid-input (with INPUT_PER_APP)
+     * register phantom extra input devices and button/key bits.  The tool
+     * is a pure gamepad, so only the Game Pad collection is kept.
      */
-    0x05, 0x01,
-    0x09, 0x02,
-    0xa1, 0x01,
-    0x85, 0x02,
-
-    0x09, 0x01,
-    0xa1, 0x00,
-
-    0x05, 0x09,
-    0x19, 0x01,
-    0x29, 0x03,
-    0x15, 0x00,
-    0x25, 0x01,
-    0x75, 0x01,
-    0x95, 0x03,
-    0x81, 0x02,
-
-    0x75, 0x01,
-    0x95, 0x05,
-    0x81, 0x03,
-
-    0x05, 0x01,
-    0x09, 0x30,
-    0x09, 0x31,
-    0x09, 0x38,
-    0x15, 0x81,
-    0x25, 0x7f,
-    0x75, 0x08,
-    0x95, 0x03,
-    0x81, 0x06,
-
-    0xc0,
-    0xc0,
-
-    /*
-     * Original consumer-control collection, unchanged.
-     */
-    0x05, 0x0c,
-    0x09, 0x01,
-    0xa1, 0x01,
-    0x15, 0x00,
-    0x25, 0x01,
-    0x75, 0x01,
-    0x95, 0x08,
-
-    0x0a, 0x83, 0x01,
-    0x0a, 0x23, 0x02,
-    0x0a, 0x24, 0x02,
-    0x09, 0x40,
-    0x09, 0xe9,
-    0x09, 0xea,
-
-    0x05, 0x07,
-    0x09, 0x28,
-    0x09, 0x75,
-
-    0x81, 0x02,
-    0xc0
 };
 
-/*
- * The controller reports the D-pad as four independent 1-bit values
- * (Down/Up/Right/Left).  hid-input's generic Generic-Desktop D-pad
- * handling only maps the first direction found in a field to a hat
- * axis and discards the rest, which is broken for this layout.  Map
- * each 1-bit direction to its own keycode (BTN_DPAD_*) instead.
- */
 static int nsl_sw001_input_mapping(struct hid_device *hdev,
                                    struct hid_input *hidinput,
                                    struct hid_field *field,
@@ -288,36 +238,20 @@ static int nsl_sw001_input_mapping(struct hid_device *hdev,
     if (field->application != HID_GD_GAMEPAD)
         return 0;
 
-    /* Newest IMU sample (bytes 36..47): accel X/Y/Z then gyro X/Y/Z,
-     * 6x int16 declared as Sensor usages.  Expose them as extra EV_ABS
-     * axes (ABS_MISC + 0..5) so they are visible in evdev tools and can
-     * feed a userspace DSU / Cemuhook bridge (Cemu, Yuzu, Ryujinx).
-     */
-    if ((usage->hid & HID_USAGE_PAGE) == HID_UP_SENSOR) {
-        int idx = usage->usage_index;
-        if (idx < 6)
-            hid_map_usage(hidinput, usage, bit, max, EV_ABS, ABS_MISC + idx);
-        return 1;
-    }
-
     switch (usage->hid) {
-    case 0x00090001:   /* Usage (A) -- Nintendo bottom face -> BTN_EAST */
+    /*
+     * Map physical A (right/east face, physical usage 0x01) to BTN_EAST
+     * (index 1) and physical B (bottom/south face, physical usage 0x02) to
+     * BTN_SOUTH (index 0), i.e. the physically-correct codes at their
+     * physical positions (matching how a genuine Nintendo Switch Pro
+     * Controller is laid out).  The controllerdb entry then reports the
+     * matching a/b roles (a:b0,b:b1) so userspace sees the right mapping.
+     */
+    case 0x00090001:   /* Usage (A) -- Nintendo right face -> BTN_EAST */
         hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_EAST);
         return 1;
-    case 0x00090002:   /* Usage (B) -- Nintendo right face -> BTN_SOUTH */
+    case 0x00090002:   /* Usage (B) -- Nintendo bottom face -> BTN_SOUTH */
         hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_SOUTH);
-        return 1;
-    case HID_GD_UP:
-        hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_DPAD_UP);
-        return 1;
-    case HID_GD_DOWN:
-        hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_DPAD_DOWN);
-        return 1;
-    case HID_GD_RIGHT:
-        hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_DPAD_RIGHT);
-        return 1;
-    case HID_GD_LEFT:
-        hid_map_usage(hidinput, usage, bit, max, EV_KEY, BTN_DPAD_LEFT);
         return 1;
     default:
         return 0;
@@ -325,21 +259,21 @@ static int nsl_sw001_input_mapping(struct hid_device *hdev,
 }
 
 /*
- * hid-core's generic mapping gives EV_ABS axes in GAMEPAD applications a
- * fuzz/flat derived from the logical range.  For the IMU axes (logical
- * -32768..32767) that means fuzz=255 and flat=4095: input core suppresses
- * any sample within ~4095 counts of center, i.e. all real gyro/accel data.
- * Clear it so raw 16-bit samples reach userspace.
+ * The D-pad is emitted as an 8-way hat switch (ABS_HAT0X/HAT0Y), matching
+ * how hid-nintendo reports a genuine Pro Controller so that Steam's built-in
+ * Switch Pro profile (dpup/dpdown/dpleft/dpright on hat 0) works.  Register
+ * the two hat axes on the gamepad node and remember that node for raw_event.
  */
 static int nsl_sw001_input_configured(struct hid_device *hdev,
                                        struct hid_input *hidinput)
 {
-    struct input_dev *input = hidinput->input;
-    int i;
+    struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
 
-    for (i = 0; i < 6; i++) {
-        if (test_bit(ABS_MISC + i, input->absbit))
-            input_set_abs_params(input, ABS_MISC + i, -32768, 32767, 0, 0);
+    if (hidinput->application == HID_GD_GAMEPAD) {
+        struct input_dev *input = hidinput->input;
+        input_set_abs_params(input, ABS_HAT0X, -1, 1, 0, 0);
+        input_set_abs_params(input, ABS_HAT0Y, -1, 1, 0, 0);
+        drvdata->gamepad_dev = input;
     }
     return 0;
 }
@@ -352,18 +286,25 @@ static int nsl_sw001_input_configured(struct hid_device *hdev,
  * values, so that userspace sees the standard convention (down=+, up=-)
  * with the rest still centered.  No SDL axis negation is then needed.
  *
- * Report layout (see header): data[0] is the report id (0x30) and the
- * sticks are bit-packed 12-bit values over data[6..11]:
+ * The same hook also extracts the newest 12-byte IMU sample (bytes
+ * data[37..48]: accel X/Y/Z then gyro X/Y/Z as int16 LE) and reports it to
+ * the separate IMU input device created in probe, mirroring how
+ * hid-nintendo / hid-sony expose it.
+ *
+ * Report layout (see header): data[0] is the report id (0x30), the sticks
+ * are bit-packed 12-bit values over data[6..11]:
  *   X  = data[6] | ((data[7] & 0x0f) << 8)
  *   Y  = (data[7] >> 4) | (data[8] << 4)
  *   Rx = data[9] | ((data[10] & 0x0f) << 8)
  *   Ry = (data[10] >> 4) | (data[11] << 4)
+ * and the newest IMU sample occupies data[37..48].
  */
 static int nsl_sw001_raw_event(struct hid_device *hdev,
                                struct hid_report *report,
                                u8 *data, int size)
 {
     unsigned int y, ry;
+    struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
 
     if (report->id != 0x30 || size < 12)
         return 0;
@@ -377,6 +318,38 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
     ry = 0x0fff - ry;
     data[10] = (data[10] & 0x0f) | ((ry & 0x0f) << 4);
     data[11] = (ry >> 4) & 0xff;
+
+    /* D-pad hat: byte 4 (data[5]) bits bit0=Dwn bit1=Up bit2=Right bit3=Left. */
+    if (drvdata && drvdata->gamepad_dev) {
+        u8 b = data[5];
+        int dx = ((b >> 2) & 1) - ((b >> 3) & 1);  /* right +1, left -1 */
+        int dy = ((b >> 0) & 1) - ((b >> 1) & 1);  /* down +1, up -1 */
+        input_report_abs(drvdata->gamepad_dev, ABS_HAT0X, dx);
+        input_report_abs(drvdata->gamepad_dev, ABS_HAT0Y, dy);
+    }
+
+    /* Newest IMU sample: 6x int16 LE at data[37..48] (full 49-byte report). */
+    if (drvdata && drvdata->imu_dev && size >= 49) {
+        s16 accel[3], gyro[3];
+        int i;
+
+        for (i = 0; i < 3; i++) {
+            accel[i] = get_unaligned_le16(&data[37 + i * 2]);
+            gyro[i]  = get_unaligned_le16(&data[43 + i * 2]);
+        }
+
+        input_report_abs(drvdata->imu_dev, ABS_X, accel[0]);
+        input_report_abs(drvdata->imu_dev, ABS_Y, accel[1]);
+        input_report_abs(drvdata->imu_dev, ABS_Z, accel[2]);
+        input_report_abs(drvdata->imu_dev, ABS_RX, gyro[0]);
+        input_report_abs(drvdata->imu_dev, ABS_RY, gyro[1]);
+        input_report_abs(drvdata->imu_dev, ABS_RZ, gyro[2]);
+
+        drvdata->imu_timestamp_us += 8000; /* ~8 ms per BT report */
+        input_event(drvdata->imu_dev, EV_MSC, MSC_TIMESTAMP,
+                    drvdata->imu_timestamp_us);
+        input_sync(drvdata->imu_dev);
+    }
 
     return 0;
 }
@@ -431,9 +404,80 @@ static bool nsl_sw001_matches_oui(struct hid_device *hdev)
     return parsed == 6;
 }
 
+/*
+ * Create a separate input device for the IMU, mirroring hid-nintendo /
+ * hid-sony so that SDL's Linux evdev sensor backend can associate it with
+ * the gamepad node (via shared uniq == controller MAC) and expose
+ * SDL_SENSOR_ACCEL/GYRO.  Accel is ABS_X/Y/Z, gyro is ABS_RX/RY/RZ.
+ */
+static int nsl_sw001_imu_input_create(struct nsl_sw001_data *drvdata,
+                                      struct hid_device *hdev)
+{
+    struct input_dev *imu_dev;
+    char *name;
+    int ret;
+
+    imu_dev = devm_input_allocate_device(&hdev->dev);
+    if (!imu_dev)
+        return -ENOMEM;
+
+    name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s IMU", hdev->name);
+    if (!name)
+        return -ENOMEM;
+
+    imu_dev->name = name;
+    imu_dev->id.bustype = hdev->bus;
+    imu_dev->id.vendor = hdev->vendor;
+    imu_dev->id.product = hdev->product;
+    imu_dev->id.version = hdev->version;
+    imu_dev->uniq = hdev->uniq;   /* shared with gamepad: SDL links them */
+    imu_dev->phys = hdev->phys;
+
+    __set_bit(INPUT_PROP_ACCELEROMETER, imu_dev->propbit);
+    __set_bit(EV_ABS, imu_dev->evbit);
+    __set_bit(EV_MSC, imu_dev->evbit);
+    __set_bit(MSC_TIMESTAMP, imu_dev->mscbit);
+
+    /* Accelerometer: ABS_X/Y/Z */
+    input_set_abs_params(imu_dev, ABS_X,
+                         -NSL_IMU_MAX_ACCEL_MAG, NSL_IMU_MAX_ACCEL_MAG,
+                         NSL_IMU_FUZZ, 0);
+    input_set_abs_params(imu_dev, ABS_Y,
+                         -NSL_IMU_MAX_ACCEL_MAG, NSL_IMU_MAX_ACCEL_MAG,
+                         NSL_IMU_FUZZ, 0);
+    input_set_abs_params(imu_dev, ABS_Z,
+                         -NSL_IMU_MAX_ACCEL_MAG, NSL_IMU_MAX_ACCEL_MAG,
+                         NSL_IMU_FUZZ, 0);
+    input_abs_set_res(imu_dev, ABS_X, NSL_IMU_ACCEL_RES_PER_G);
+    input_abs_set_res(imu_dev, ABS_Y, NSL_IMU_ACCEL_RES_PER_G);
+    input_abs_set_res(imu_dev, ABS_Z, NSL_IMU_ACCEL_RES_PER_G);
+
+    /* Gyroscope: ABS_RX/RY/RZ */
+    input_set_abs_params(imu_dev, ABS_RX,
+                         -NSL_IMU_MAX_GYRO_MAG, NSL_IMU_MAX_GYRO_MAG,
+                         NSL_IMU_FUZZ, 0);
+    input_set_abs_params(imu_dev, ABS_RY,
+                         -NSL_IMU_MAX_GYRO_MAG, NSL_IMU_MAX_GYRO_MAG,
+                         NSL_IMU_FUZZ, 0);
+    input_set_abs_params(imu_dev, ABS_RZ,
+                         -NSL_IMU_MAX_GYRO_MAG, NSL_IMU_MAX_GYRO_MAG,
+                         NSL_IMU_FUZZ, 0);
+    input_abs_set_res(imu_dev, ABS_RX, NSL_IMU_GYRO_RES_PER_DPS);
+    input_abs_set_res(imu_dev, ABS_RY, NSL_IMU_GYRO_RES_PER_DPS);
+    input_abs_set_res(imu_dev, ABS_RZ, NSL_IMU_GYRO_RES_PER_DPS);
+
+    ret = input_register_device(imu_dev);
+    if (ret)
+        return ret;
+
+    drvdata->imu_dev = imu_dev;
+    return 0;
+}
+
 static int nsl_sw001_probe(struct hid_device *hdev,
                            const struct hid_device_id *id)
 {
+    struct nsl_sw001_data *drvdata;
     int ret;
 
     /*
@@ -447,6 +491,11 @@ static int nsl_sw001_probe(struct hid_device *hdev,
         return -ENODEV;
     }
 
+    drvdata = devm_kzalloc(&hdev->dev, sizeof(*drvdata), GFP_KERNEL);
+    if (!drvdata)
+        return -ENOMEM;
+    hid_set_drvdata(hdev, drvdata);
+
     hdev->quirks |= HID_QUIRK_INPUT_PER_APP;
 
     ret = hid_parse(hdev);
@@ -455,9 +504,25 @@ static int nsl_sw001_probe(struct hid_device *hdev,
         return ret;
     }
 
-    ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+    /*
+     * Deliberately do NOT pass HID_CONNECT_HIDRAW.  We only want the evdev
+     * (HIDINPUT) node plus our driver callbacks (HID_CONNECT_DRIVER).  The
+     * SW001 cannot speak the Nintendo Switch protocol, and Steam Input's own
+     * bundled HIDAPI driver grabs the device over hidraw when it identifies
+     * as 057e:2009, producing a scrambled button mapping.  With no hidraw
+     * node, Steam Input cannot take the HIDAPI path and must fall back to
+     * our evdev node, which already exposes standard Linux gamepad codes
+     * (identical to hid-nintendo's genuine Pro Controller layout).
+     */
+    ret = hid_hw_start(hdev, HID_CONNECT_HIDINPUT | HID_CONNECT_DRIVER);
     if (ret) {
         hid_err(hdev, "HID hardware start failed: %d\n", ret);
+        return ret;
+    }
+
+    ret = nsl_sw001_imu_input_create(drvdata, hdev);
+    if (ret) {
+        hid_err(hdev, "IMU input device creation failed: %d\n", ret);
         return ret;
     }
 

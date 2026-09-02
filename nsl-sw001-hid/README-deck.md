@@ -2,7 +2,7 @@
 
 Makes the N-SL SW001 Bluetooth "Pro Controller" clone work on a Steam Deck
 running SteamOS. This is **step 1**: get the existing `hid-nsl-sw001` driver
-installed and working on the Deck. No IMU/gyro work is included yet.
+installed and working on the Deck, including IMU/gyro in Steam Input.
 
 ## What it does
 
@@ -11,9 +11,10 @@ installed and working on the Deck. No IMU/gyro work is included yet.
 - **Globally blacklists `hid_nintendo`** so it stops claiming the SW001 (it
   matches 057e:2009 but can't speak Nintendo's protocol, times out with -110
   and never releases the device).
-- Installs the SDL/Steam Input environment so Steam sees the controller
-  correctly.  The `SDL_*` vars are appended to **`/etc/environment`** so they
-  reach Steam in **both** Game Mode and Desktop Mode (Game Mode ignores
+- Installs the **IMU uaccess udev rule** and the SDL/Steam Input environment so
+  Steam sees the controller correctly **and** can read the gyro/accelerometer.
+  The `SDL_*` vars are appended to **`/etc/environment`** so they reach Steam in
+  **both** Game Mode and Desktop Mode (Game Mode ignores
   `~/.config/environment.d/`), plus a per-user `environment.d` copy for
   Desktop Mode.
 - Re-enables the read-only rootfs after install.
@@ -28,6 +29,7 @@ installed and working on the Deck. No IMU/gyro work is included yet.
 | `steamos-nsl-ensure.sh` | Boot-time self-seeding rebuild script |
 | `steamos-nsl-ensure.service` | systemd unit that runs it at boot |
 | `blacklist-hid-nintendo.conf` | Global modprobe blacklist of `hid_nintendo` |
+| `99-nsl-sw001-imu.rules` | udev rule granting the IMU node access (REQUIRED for gyro in Steam Input) |
 | `modules-load-nsl-sw001.conf` | Load `hid-nsl-sw001` at boot |
 | `atomic-update-additional-keep-list.conf` | Makes `hid_nintendo` blacklist + unit + `/etc/environment` survive SteamOS updates |
 | `environment-nsl-sw001.conf` | Per-user `SDL_HIDAPI_IGNORE_DEVICES` + `SDL_GAMECONTROLLERCONFIG` (Desktop Mode) |
@@ -62,6 +64,55 @@ cat /sys/bus/hid/devices/0005:057E:2009.*/uniq   # expect your SW001 MAC
 evtest
 ```
 
+## IMU (gyro / accelerometer) and the udev rule
+
+The driver exposes the IMU as a **separate evdev input device** ("Pro Controller
+IMU") with the accelerometer on `ABS_X/Y/Z` and gyroscope on `ABS_RX/RY/RZ`,
+matching what upstream `hid-nintendo`/`hid-playstation` create, so SDL's Linux
+sensor backend can expose `SDL_SENSOR_ACCEL/GYRO` and Steam Input can use the
+gyro.
+
+That IMU node needs a udev rule (`99-nsl-sw001-imu.rules`) to be readable by
+your (non-root) user:
+
+- The **main gamepad node** gets an ACL for the logged-in user via Steam's
+  `60-steam-input.rules` (the `057E:2009` uaccess rule) — matching the VID/PID
+  the SW001 impersonates — so it "just works".
+- The **separate IMU input node does not**: udev classifies it
+  `ID_INPUT_ACCELEROMETER` (not `ID_INPUT_JOYSTICK`), so the generic systemd
+  joystick uaccess rule doesn't tag it, and it's not a hidraw node, so Steam's
+  hidraw rules don't tag it either. Without access, SDL's `open()` on it fails
+  with `EACCES`, `SDL_GamepadHasSensor` returns false, and Steam Input shows no
+  gyro.
+- Genuine Pro Controllers avoid this because SDL/Steam talk to them over
+  **hidraw** (HIDAPI), which Steam's rule tags — the separate evdev IMU node is
+  never opened. The SW001 is forced onto the evdev backend
+  (`SDL_HIDAPI_IGNORE_DEVICES`), which *does* open that node.
+
+The installer installs this rule and it survives SteamOS A/B updates (it is
+seeded under `/home/.steamos-nsl-sw001/etc/`, re-asserted by
+`steamos-nsl-ensure.sh`, and added to the atomic-update keep-list).
+
+> The rule's `uaccess` tag applies at device-add time. If you add the rule to an
+> already-connected controller, reconnect it (or run
+> `sudo udevadm trigger /sys/class/input/eventN`); a non-root trigger won't work.
+
+Verify IMU access (root):
+
+```bash
+ls -l /dev/input/event*                # IMU node should show crw-rw----+
+getfacl /dev/input/event*              # IMU node should have user:<you>:rw-
+```
+
+Verify in SDL (run through the shim so the SDL vars are set):
+
+```bash
+SDL_HIDAPI_IGNORE_DEVICES="0x057e/0x2009" \
+SDL_GAMECONTROLLERCONFIG="$(cat nsl-sw001-controllersdb.txt)" \
+./live_sensor
+#   -> "ACCEL: present" / "GYRO: present" + live values while tilting
+```
+
 ## How persistence across A/B updates works
 
 SteamOS swaps the whole root partition (`/usr`) on each update, so anything
@@ -80,7 +131,8 @@ So the installer:
    to the atomic-update keep-list so it runs on future boots.
 3. At each boot, `steamos-nsl-ensure.sh` re-seeds `/usr` and `/etc` from the
    `/home` copy, re-pins the matching kernel headers, runs `dkms build/install`
-   for the current kernel, and loads `hid-nsl-sw001`.
+   for the current kernel, re-asserts the IMU udev rule + SDL env, and loads
+   `hid-nsl-sw001`.
 
 This is the same self-healing pattern Valve's NVIDIA installer uses.
 

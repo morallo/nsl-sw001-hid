@@ -121,6 +121,17 @@ if [ ! -f /etc/atomic-update.conf.d/nsl-sw001.conf ]; then
         /etc/atomic-update.conf.d/nsl-sw001.conf
 fi
 
+# IMU udev rule: required for SDL/Steam Input to read gyro/accel.  The main
+# gamepad node gets a uaccess ACL from Steam's rules, but the separate
+# "Pro Controller IMU" input node does not, so SDL can't open it (EACCES).
+if [ ! -f /etc/udev/rules.d/99-nsl-sw001-imu.rules ]; then
+    log "re-asserting IMU uaccess udev rule"
+    run_priv mkdir -p /etc/udev/rules.d
+    run_priv cp "$SEED/etc/99-nsl-sw001-imu.rules" \
+        /etc/udev/rules.d/99-nsl-sw001-imu.rules
+    run_priv udevadm control --reload || true
+fi
+
 # ensure unit itself (in case of a fresh slot)
 run_priv cp "$SEED/etc/steamos-nsl-ensure.service" \
     /etc/systemd/system/steamos-nsl-ensure.service
