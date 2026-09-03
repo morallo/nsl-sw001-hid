@@ -1,5 +1,7 @@
 # N-SL SW001 Bluetooth controller driver for Linux
 
+<img height="400" alt="N-SL SW001 controller" src="https://github.com/user-attachments/assets/68f28ceb-f05c-482b-b8e4-864679484667" />
+
 A custom Linux HID driver that makes the **N-SL SW001** (a cheap Nintendo
 Switch "Pro Controller" clone) work over **Bluetooth on a PC / Steam Deck**.
 
