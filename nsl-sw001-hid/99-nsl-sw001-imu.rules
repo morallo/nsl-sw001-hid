@@ -2,4 +2,16 @@
 # The gamepad joystick node gets a uaccess ACL via Steam's rules, but the
 # separate "Pro Controller IMU" input node does not, leaving SDL unable to
 # open it (EACCES), so SDL_GamepadHasSensor(ACCEL/GYRO) is always false.
-SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pro Controller IMU", TAG+="uaccess"
+#
+# TAG+="seat" is needed too: 71-seat.rules propagates uaccess->seat for
+# tag==uaccess devices, but it runs at priority 71, BEFORE this 99 rule, so
+# the seat tag never arrives and the uaccess ACL is not applied.
+#
+# The ACL from uaccess/seat alone is racy on reconnect: logind stamps
+# SYSTEMD_SEAT and applies the ACL asynchronously, after udev has already
+# created the node and SDL has tried to open it.  The RUN setfacl applies
+# the ACL synchronously inside the ADD event, before SDL gets a chance.
+# The user is resolved from the seat's active session (no hardcoded name).
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Pro Controller IMU", \
+  TAG+="uaccess", TAG+="seat", \
+  RUN+="/bin/sh -c 'u=$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null); u=$(loginctl show-session $u -p Name --value 2>/dev/null); setfacl -m u:$u:rw /dev/input/%k'"

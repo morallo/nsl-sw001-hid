@@ -253,3 +253,30 @@ See the header comment in `hid-nsl-sw001.c` for the full byte map.
 
 MIT License. Provided as-is, no warranty. Hardware is a third-party clone; this is
 an independent reverse-engineering effort, not affiliated with Nintendo.
+
+# Reference data
+
+- Reddit post: https://www.reddit.com/r/linux_gaming/comments/fxwh54/using_nintendo_switch_controllers_on_linux/
+
+- Genuine controller HID Descriptors and devide identity: https://deepwiki.com/churunfa/SwitchProControllerEsp32S3/5.2-hid-descriptors-and-device-identity
+- Genuine controller Report types and processing: https://deepwiki.com/churunfa/SwitchProControllerEsp32S3/5.3-report-processing
+- Genuine Controller state management and input report structure: https://deepwiki.com/churunfa/SwitchProControllerEsp32S3/5.4-controller-state-management
+- Genuine Controller IMU (accelerometer, gyro) reference information: nsl_sw001_IMU.md
+
+## Nintendo Bluetooth HID protocol
+
+- Bluetooth HID protocol: https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/bluetooth_hid_notes.md
+- Bluetooth subcommands: https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/bluetooth_hid_subcommands_notes.md
+
+## Kernel Drivers
+
+- In-tree kernel driver (hid-nintendo): https://raw.githubusercontent.com/DanielOgorchock/linux/refs/heads/ogorchock/drivers/hid/hid-nintendo.c
+- Generic Pro Controller support in hid-nintendo: https://github.com/DanielOgorchock/linux/issues/10
+- DMKS driver: https://github.com/nicman23/dkms-hid-nintendo
+- Specific driver for 3rd party Hori controller: https://gitlab.com/cipitaua/dkms-hid-nintendolic
+
+## Other Userland projects
+
+- [joycond](https://github.com/DanielOgorchock/joycond): A userspace daemon to combine joy-cons from the hid-nintendo kernel driver
+- [joycond-cemuhook](https://github.com/joaorb64/joycond-cemuhook): Support for cemuhook's UDP protocol for joycond devices
+
