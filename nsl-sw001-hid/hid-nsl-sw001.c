@@ -4,6 +4,10 @@
 #include <linux/module.h>
 #include <linux/input.h>
 #include <linux/unaligned.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h>
+#include <linux/mutex.h>
+#include <linux/math.h>
 
 #define USB_VENDOR_ID_NINTENDO 0x057e
 #define USB_DEVICE_ID_PRO_CONTROLLER 0x2009
@@ -56,15 +60,67 @@
 
 /*
  * IMU axis ranges/resolutions, matching upstream hid-nintendo
- * (drivers/hid/hid-nintendo.c).  The reported values are raw/uncalibrated
- * 16-bit samples but are normalized to these advertised resolutions so
- * SDL's evdev sensor backend can scale them to physical units.
+ * (drivers/hid/hid-nintendo.c).  The reported values are 16-bit samples
+ * that are calibrated (offset + scale from the controller's SPI flash) and
+ * normalized to these advertised resolutions so SDL's evdev sensor backend
+ * can scale them to physical units.
  */
 #define NSL_IMU_MAX_ACCEL_MAG   32767
 #define NSL_IMU_ACCEL_RES_PER_G 4096    /* counts per G */
 #define NSL_IMU_MAX_GYRO_MAG     32767000 /* (2^16-1)*1000 */
 #define NSL_IMU_GYRO_RES_PER_DPS 14247   /* (14.247*1000) counts per deg/s */
 #define NSL_IMU_FUZZ             10
+#define NSL_IMU_PREC_RANGE_SCALE 1000   /* gyro precision-save scaling */
+
+/*
+ * Default IMU calibration (used if reading SPI flash fails), matching the
+ * defaults in upstream hid-nintendo.
+ */
+#define NSL_DFLT_ACCEL_OFFSET 0
+#define NSL_DFLT_ACCEL_SCALE  16384
+#define NSL_DFLT_GYRO_OFFSET  0
+#define NSL_DFLT_GYRO_SCALE   13371
+
+/*
+ * Nintendo Switch subcommand protocol (used to read IMU calibration from
+ * the controller's SPI flash at connection time).  A subcommand is sent as
+ * output report 0x01 (rumble + subcmd); the controller replies with input
+ * report 0x21 (subcmd reply).  References:
+ *   https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/
+ *       blob/master/bluetooth_hid_notes.md
+ */
+#define NSL_OUTPUT_RUMBLE_AND_SUBCMD   0x01
+#define NSL_INPUT_SUBCMD_REPLY         0x21
+#define NSL_INPUT_IMU_DATA             0x30
+#define NSL_SUBCMD_SPI_FLASH_READ      0x10
+
+/* Minimum gap between BT output reports, mirroring hid-nintendo's
+ * JC_SUBCMD_RATE_LIMITER_BT_MS.  Sending too fast disconnects the clone. */
+#define NSL_OUTPUT_MIN_DELTA_MS  60
+
+/*
+ * SPI read retry policy, derived from the Android 17 capture
+ * (btsnoop_hci_android17.log): the clone often ignores the first 0x10
+ * subcommands after connect (0x8012/0x801d reads got no reply at t=0.18s
+ * and were resent at +1s and +2s before being abandoned), while the
+ * working 0x6020 read at t=4.33s succeeded on the first try.  Mirror that:
+ * retry up to NSL_SPI_READ_RETRIES times, spaced ~1s apart.
+ */
+#define NSL_SPI_READ_RETRIES        3
+#define NSL_SPI_READ_RETRY_DELAY_MS 1000
+
+/* SPI flash addresses of factory/user IMU calibration data */
+#define NSL_IMU_CAL_FCT_ADDR           0x6020
+#define NSL_IMU_CAL_FCT_END            0x6037
+#define NSL_IMU_CAL_DATA_SIZE          (NSL_IMU_CAL_FCT_END - NSL_IMU_CAL_FCT_ADDR + 1)
+#define NSL_IMU_CAL_USR_MAGIC_ADDR     0x8026
+#define NSL_IMU_CAL_USR_MAGIC_SIZE     2
+#define NSL_IMU_CAL_USR_DATA_ADDR      0x8028
+#define NSL_CAL_USR_MAGIC_0            0xB2
+#define NSL_CAL_USR_MAGIC_1            0xA1
+
+/* Size of the largest subcmd reply we can receive (input report + 35) */
+#define NSL_MAX_RESP_SIZE              64
 
 struct nsl_sw001_data {
     /* Separate IMU input device (accel ABS_X/Y/Z, gyro ABS_RX/RY/RZ) */
@@ -73,7 +129,37 @@ struct nsl_sw001_data {
     struct input_dev *gamepad_dev;
     /* Synthetic per-report timestamp counter (us) for MSC_TIMESTAMP */
     s64 imu_timestamp_us;
+
+    /* Synchronous subcmd I/O */
+    struct mutex output_mutex;
+    wait_queue_head_t wait;
+    spinlock_t lock;
+    bool received_resp;
+    u8 subcmd_ack_match;
+    u8 subcmd_num;
+    u8 input_buf[NSL_MAX_RESP_SIZE];
+
+    /* IMU calibration data (offset + scale per axis, + precomputed divs) */
+    s16 accel_offset[3];
+    s16 accel_scale[3];
+    s16 gyro_offset[3];
+    s16 gyro_scale[3];
+    s32 accel_divisor[3];
+    s32 gyro_divisor[3];
+
+    /* Last BT output report timestamp, to throttle sends (see
+     * nsl_enforce_output_rate). */
+    unsigned long last_output_msecs;
 };
+
+/* Output report payload: 0x01 output_id + packet count + 8-byte rumble */
+struct nsl_subcmd_request {
+    u8 output_id;
+    u8 packet_num;
+    u8 rumble_data[8];
+    u8 subcmd_id;
+    u8 data[];
+} __packed;
 
 static const __u8 nsl_sw001_rdesc[] = {
     0x05, 0x01,       /* Usage Page (Generic Desktop) */
@@ -218,6 +304,34 @@ static const __u8 nsl_sw001_rdesc[] = {
     0x95, 0x24,       /* Report Count (36)  -- bytes 12..47 */
     0x81, 0x01,       /* Input (Const) */
 
+    /*
+     * Input report (report id 0x21, 49 bytes): the subcommand reply.
+     * Declared as all-Const so hid-input produces no controls for it; its
+     * only purpose is to make hid-core instantiate a hid_report for report
+     * id 0x21.  Without a declared report, hid_get_report() returns NULL
+     * and hid_input_report() drops the byte stream BEFORE .raw_event is
+     * called, so nsl_sw001_send_subcmd() would always time out (-110).
+     * nsl_sw001_raw_event() inspects and forwards the reply to the waiter.
+     */
+    0x85, 0x21,       /* Report ID (0x21) */
+    0x75, 0x08,
+    0x95, 0x30,       /* Report Count (48) -- timer, state, rumble, ack, data */
+    0x81, 0x01,       /* Input (Const) */
+
+    /*
+     * Output report (report id 0x01, 16 bytes): the pack + rumble +
+     * subcommand report.  We never let hid-input interpret it (it is sent
+     * only by nsl_sw001_send_subcmd() with nsl_sw001_spi_flash_read()).
+     * The size matches the Android 17 capture: every working subcmd output
+     * report is SHORT (report id + pack counter + 8-byte rumble + subcmd +
+     * data, 16 bytes for an SPI flash read), never the genuine controller's
+     * 49-byte padded form.
+     */
+    0x85, 0x01,       /* Report ID (0x01) */
+    0x75, 0x08,
+    0x95, 0x0f,       /* Report Count (15) -- pack + 8 rumble + subcmd + data */
+    0x91, 0x01,       /* Output (Const) */
+
     0xc0,
 
     /*
@@ -306,6 +420,28 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
     unsigned int y, ry;
     struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
 
+    /*
+     * Subcmd reply (0x21): wake any synchronous waiter that sent a
+     * subcommand and is blocked in wait_event_timeout(). Copy the whole
+     * reply into input_buf for the caller to parse.  Return 0 so the
+     * report still flows through hid-input handling unchanged.
+     */
+    if (data[0] == NSL_INPUT_SUBCMD_REPLY && drvdata) {
+        unsigned long flags;
+
+        spin_lock_irqsave(&drvdata->lock, flags);
+        if (!drvdata->received_resp) {
+            memcpy(drvdata->input_buf, data,
+                   min(size, (int)NSL_MAX_RESP_SIZE));
+            drvdata->received_resp = true;
+            spin_unlock_irqrestore(&drvdata->lock, flags);
+            wake_up(&drvdata->wait);
+        } else {
+            spin_unlock_irqrestore(&drvdata->lock, flags);
+        }
+        return 0;
+    }
+
     if (report->id != 0x30 || size < 12)
         return 0;
 
@@ -330,12 +466,29 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
 
     /* Newest IMU sample: 6x int16 LE at data[37..48] (full 49-byte report). */
     if (drvdata && drvdata->imu_dev && size >= 49) {
-        s16 accel[3], gyro[3];
+        s16 raw_accel[3], raw_gyro[3];
+        s32 accel[3], gyro[3];
         int i;
 
+        /*
+         * Extract raw 16-bit samples, then apply the controller's factory
+         * calibration (read from SPI flash at connect time) exactly like
+         * hid-nintendo.  Gyro subtracts the per-axis offset and scales;
+         * accel only scales (offset subtraction was found to hurt accuracy).
+         * The result is normalized to the advertised absinfo resolution.
+         */
         for (i = 0; i < 3; i++) {
-            accel[i] = get_unaligned_le16(&data[37 + i * 2]);
-            gyro[i]  = get_unaligned_le16(&data[43 + i * 2]);
+            raw_accel[i] = get_unaligned_le16(&data[37 + i * 2]);
+            raw_gyro[i]  = get_unaligned_le16(&data[43 + i * 2]);
+        }
+
+        for (i = 0; i < 3; i++) {
+            gyro[i] = mult_frac(NSL_IMU_PREC_RANGE_SCALE *
+                                (raw_gyro[i] - drvdata->gyro_offset[i]),
+                                drvdata->gyro_scale[i],
+                                drvdata->gyro_divisor[i]);
+            accel[i] = ((s32)raw_accel[i] * drvdata->accel_scale[i]) /
+                       drvdata->accel_divisor[i];
         }
 
         input_report_abs(drvdata->imu_dev, ABS_X, accel[0]);
@@ -352,6 +505,226 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
     }
 
     return 0;
+}
+
+/*
+ * Throttle BT output reports to >= NSL_OUTPUT_MIN_DELTA_MS apart.  Sending
+ * subcommands too fast disconnects the clone (mirrors hid-nintendo's
+ * joycon_enforce_subcmd_rate, minus the report-delta and TX-offset
+ * refinements).
+ */
+static void nsl_enforce_output_rate(struct nsl_sw001_data *drvdata)
+{
+    unsigned long msecs = jiffies_to_msecs(jiffies);
+    unsigned long delta = msecs - drvdata->last_output_msecs;
+
+    if (delta < NSL_OUTPUT_MIN_DELTA_MS)
+        msleep(NSL_OUTPUT_MIN_DELTA_MS - delta);
+    drvdata->last_output_msecs = jiffies_to_msecs(jiffies);
+}
+
+/*
+ * Send an output report and synchronously wait for the matching subcmd
+ * reply (0x21), mirroring hid-nintendo's joycon_hid_send_sync().  No retry:
+ * calibration is best-effort (fall back to stock defaults on failure) and
+ * this runs on the shared HIDP dev_init worker, which the disconnect path
+ * cancel_work_sync()s — the probe must fail fast, not stall teardown.
+ * The reply is left in drvdata->input_buf on success.
+ */
+static int nsl_sw001_hid_send_sync(struct hid_device *hdev,
+                                   struct nsl_sw001_data *drvdata,
+                                   u8 *data, size_t len, u32 timeout)
+{
+    u8 *buf;
+    int ret;
+
+    buf = kmemdup(data, len, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    nsl_enforce_output_rate(drvdata);
+    ret = hid_hw_output_report(hdev, buf, len);
+    kfree(buf);
+    if (ret < 0) {
+        hid_dbg(hdev, "output report failed; ret=%d\n", ret);
+        return ret;
+    }
+
+    ret = wait_event_timeout(drvdata->wait, drvdata->received_resp,
+                             timeout);
+    if (!ret) {
+        hid_dbg(hdev, "subcmd timed out\n");
+        memset(drvdata->input_buf, 0, NSL_MAX_RESP_SIZE);
+        ret = -ETIMEDOUT;
+    } else {
+        ret = 0;
+    }
+
+    drvdata->received_resp = false;
+    return ret;
+}
+
+/*
+ * The SW001 accepts subcommand output reports at their natural length
+ * (output_id + pack counter + 8 rumble + subcmd + data), NOT padded to the
+ * genuine controller's 49-byte form.  The Android 17 capture
+ * (btsnoop_hci_android17.log) shows every SPI-flash-read subcmd sent as a
+ * 16-byte report (A2 01 + 16) and answered, while the polled/report-desc
+ * 49-byte form gets no reply (ret=-110).
+ */
+#define NSL_SUBCMD_REPORT_SIZE (sizeof(struct nsl_subcmd_request) + 5)
+
+/*
+ * Build a subcommand output report (output_id 0x01, rolling packet count,
+ * zeroed rumble field) at its natural length, and send it with a
+ * synchronous wait for the reply.
+ */
+static int nsl_sw001_send_subcmd(struct hid_device *hdev,
+                                 struct nsl_sw001_data *drvdata,
+                                 u8 subcmd_id, u8 *data, size_t data_len,
+                                 u32 timeout)
+{
+    struct nsl_subcmd_request *req;
+    u8 buffer[NSL_SUBCMD_REPORT_SIZE] = { 0 };
+    int ret;
+
+    req = (struct nsl_subcmd_request *)buffer;
+    req->output_id = NSL_OUTPUT_RUMBLE_AND_SUBCMD;
+    req->packet_num = drvdata->subcmd_num;
+    if (++drvdata->subcmd_num > 0xF)
+        drvdata->subcmd_num = 0;
+    req->subcmd_id = subcmd_id;
+    if (data && data_len)
+        memcpy(req->data, data, data_len);
+
+    /* Set match fields before sending so raw_event can match the reply */
+    drvdata->subcmd_ack_match = subcmd_id;
+    drvdata->received_resp = false;
+
+    mutex_lock(&drvdata->output_mutex);
+    ret = nsl_sw001_hid_send_sync(hdev, drvdata, buffer,
+                                  sizeof(struct nsl_subcmd_request) + data_len,
+                                  timeout);
+    mutex_unlock(&drvdata->output_mutex);
+
+    return ret;
+}
+
+/*
+ * Read `size` bytes from the controller's SPI flash at `addr` via subcmd
+ * 0x10.  On success the data is copied to `reply_data`.
+ */
+static int nsl_sw001_spi_flash_read(struct hid_device *hdev,
+                                    struct nsl_sw001_data *drvdata,
+                                    u32 addr, u8 size, u8 *reply_data)
+{
+    u8 cmd[5];
+    int ret;
+
+    put_unaligned_le32(addr, cmd);
+    cmd[4] = size;
+
+    for (int attempt = 0; attempt < NSL_SPI_READ_RETRIES; attempt++) {
+        ret = nsl_sw001_send_subcmd(hdev, drvdata, NSL_SUBCMD_SPI_FLASH_READ,
+                                    cmd, sizeof(cmd), HZ / 4);
+        if (!ret)
+            break;
+        if (attempt < NSL_SPI_READ_RETRIES - 1)
+            msleep(NSL_SPI_READ_RETRY_DELAY_MS);
+    }
+    if (ret) {
+        hid_err(hdev, "SPI flash read at 0x%04x failed after %d tries; "
+                "ret=%d\n", addr, NSL_SPI_READ_RETRIES, ret);
+        return ret;
+    }
+
+    /*
+     * Input report 0x21 layout:
+     *   [0] id = 0x21, [1] timer, [2] battery/con,
+     *   [3..5] buttons, [6..8] left stick, [9..11] right stick,
+     *   [12] vibrator, [13] ack, [14] subcmd id,
+     *   [15..18] address echo, [19] size echo, [20..] SPI data.
+     */
+    if (drvdata->input_buf[0] != NSL_INPUT_SUBCMD_REPLY) {
+        hid_err(hdev, "unexpected reply id 0x%02x\n", drvdata->input_buf[0]);
+        return -EIO;
+    }
+    if (!(drvdata->input_buf[13] & 0x80) ||
+        drvdata->input_buf[14] != NSL_SUBCMD_SPI_FLASH_READ) {
+        hid_err(hdev, "SPI read NACK or mismatch (ack=0x%02x id=0x%02x)\n",
+                drvdata->input_buf[13], drvdata->input_buf[14]);
+        return -EIO;
+    }
+    memcpy(reply_data, &drvdata->input_buf[20], size);
+    return 0;
+}
+
+/*
+ * Read the controller's IMU calibration from SPI flash at connect time.
+ * Uses the user calibration if present (magic at 0x8026), otherwise the
+ * factory calibration at 0x6020.  On any failure, falls back to the same
+ * defaults as hid-nintendo.  Precomputes the scale/offset divisors too.
+ */
+static void nsl_sw001_read_imu_calibration(struct hid_device *hdev,
+                                           struct nsl_sw001_data *drvdata)
+{
+    u8 cal_data[NSL_IMU_CAL_DATA_SIZE];
+    u8 magic[NSL_IMU_CAL_USR_MAGIC_SIZE];
+    u16 cal_addr = NSL_IMU_CAL_FCT_ADDR;
+    int ret, i;
+
+    ret = nsl_sw001_spi_flash_read(hdev, drvdata, NSL_IMU_CAL_USR_MAGIC_ADDR,
+                                   NSL_IMU_CAL_USR_MAGIC_SIZE, magic);
+    if (!ret && magic[0] == NSL_CAL_USR_MAGIC_0 &&
+        magic[1] == NSL_CAL_USR_MAGIC_1) {
+        cal_addr = NSL_IMU_CAL_USR_DATA_ADDR;
+        hid_info(hdev, "using user IMU calibration\n");
+    } else {
+        hid_info(hdev, "using factory IMU calibration\n");
+    }
+
+    ret = nsl_sw001_spi_flash_read(hdev, drvdata, cal_addr,
+                                   NSL_IMU_CAL_DATA_SIZE, cal_data);
+    if (ret) {
+        hid_warn(hdev, "IMU cal read failed, using defaults; ret=%d\n", ret);
+        for (i = 0; i < 3; i++) {
+            drvdata->accel_offset[i] = NSL_DFLT_ACCEL_OFFSET;
+            drvdata->accel_scale[i]  = NSL_DFLT_ACCEL_SCALE;
+            drvdata->gyro_offset[i]  = NSL_DFLT_GYRO_OFFSET;
+            drvdata->gyro_scale[i]   = NSL_DFLT_GYRO_SCALE;
+        }
+    } else {
+        /* 24 bytes: accel offset[3], accel scale[3], gyro offset[3], gyro scale[3] */
+        for (i = 0; i < 3; i++) {
+            int j = i * 2;
+            drvdata->accel_offset[i] = get_unaligned_le16(cal_data + j);
+            drvdata->accel_scale[i]  = get_unaligned_le16(cal_data + j + 6);
+            drvdata->gyro_offset[i]  = get_unaligned_le16(cal_data + j + 12);
+            drvdata->gyro_scale[i]   = get_unaligned_le16(cal_data + j + 18);
+        }
+        hid_info(hdev,
+                 "IMU cal: accel o=[%d,%d,%d] s=[%d,%d,%d] "
+                 "gyro o=[%d,%d,%d] s=[%d,%d,%d]\n",
+                 drvdata->accel_offset[0], drvdata->accel_offset[1],
+                 drvdata->accel_offset[2],
+                 drvdata->accel_scale[0], drvdata->accel_scale[1],
+                 drvdata->accel_scale[2],
+                 drvdata->gyro_offset[0], drvdata->gyro_offset[1],
+                 drvdata->gyro_offset[2],
+                 drvdata->gyro_scale[0], drvdata->gyro_scale[1],
+                 drvdata->gyro_scale[2]);
+    }
+
+    for (i = 0; i < 3; i++) {
+        drvdata->accel_divisor[i] = drvdata->accel_scale[i] -
+                                    drvdata->accel_offset[i];
+        drvdata->gyro_divisor[i]  = drvdata->gyro_scale[i] -
+                                    drvdata->gyro_offset[i];
+        if (!drvdata->accel_divisor[i])
+            drvdata->accel_divisor[i] = 1;
+        if (!drvdata->gyro_divisor[i])
+            drvdata->gyro_divisor[i] = 1;
+    }
 }
 
 static const __u8 *nsl_sw001_report_fixup(struct hid_device *hdev,
@@ -496,6 +869,26 @@ static int nsl_sw001_probe(struct hid_device *hdev,
         return -ENOMEM;
     hid_set_drvdata(hdev, drvdata);
 
+    /* Initialize synchronous subcmd I/O primitives */
+    mutex_init(&drvdata->output_mutex);
+    init_waitqueue_head(&drvdata->wait);
+    spin_lock_init(&drvdata->lock);
+
+    /* Seed calibration with defaults in case the SPI read fails */
+    {
+        int i;
+        for (i = 0; i < 3; i++) {
+            drvdata->accel_offset[i] = NSL_DFLT_ACCEL_OFFSET;
+            drvdata->accel_scale[i]  = NSL_DFLT_ACCEL_SCALE;
+            drvdata->gyro_offset[i]  = NSL_DFLT_GYRO_OFFSET;
+            drvdata->gyro_scale[i]   = NSL_DFLT_GYRO_SCALE;
+            drvdata->accel_divisor[i] = NSL_DFLT_ACCEL_SCALE -
+                                        NSL_DFLT_ACCEL_OFFSET;
+            drvdata->gyro_divisor[i]  = NSL_DFLT_GYRO_SCALE -
+                                        NSL_DFLT_GYRO_OFFSET;
+        }
+    }
+
     hdev->quirks |= HID_QUIRK_INPUT_PER_APP;
 
     ret = hid_parse(hdev);
@@ -520,13 +913,61 @@ static int nsl_sw001_probe(struct hid_device *hdev,
         return ret;
     }
 
-    ret = nsl_sw001_imu_input_create(drvdata, hdev);
+    /* Open the HID device so output reports (subcommands) can be sent. */
+    ret = hid_hw_open(hdev);
     if (ret) {
-        hid_err(hdev, "IMU input device creation failed: %d\n", ret);
+        hid_err(hdev, "HID hardware open failed: %d\n", ret);
+        hid_hw_stop(hdev);
         return ret;
     }
 
+    /*
+     * Release driver_input_lock mid-probe so incoming reports reach
+     * raw_event.  hid_device_probe() holds driver_input_lock for the whole
+     * probe; during it __hid_input_report()'s down_trylock() fails and the
+     * report is dropped BEFORE raw_event.  The synchronous SPI calibration
+     * read below waits for the 0x21 reply inside probe, so without this it
+     * can never be delivered and the read always times out (ret=-110).
+     * hid-nintendo does the same right after hid_hw_open (line 2249).
+     */
+    hid_device_io_start(hdev);
+
+    ret = nsl_sw001_imu_input_create(drvdata, hdev);
+    if (ret) {
+        hid_err(hdev, "IMU input device creation failed: %d\n", ret);
+        hid_hw_close(hdev);
+        hid_hw_stop(hdev);
+        return ret;
+    }
+
+    /*
+     * Read the IMU calibration from SPI flash.  Best-effort: short
+     * timeouts, no retries, falls back to defaults on any failure so the
+     * probe cannot stall the HIDP teardown path.
+     */
+    nsl_sw001_read_imu_calibration(hdev, drvdata);
+
     return 0;
+}
+
+static void nsl_sw001_remove(struct hid_device *hdev)
+{
+    struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
+
+    if (drvdata) {
+        /*
+         * The IMU device is registered separately from hid-input; hid core
+         * only tears down the gamepad nodes, so unregister it here or it
+         * lingers as a zombie evdev node whose uniq/phys point into the
+         * freed hid_device (UAF if userspace still holds it open).
+         */
+        if (drvdata->imu_dev) {
+            input_unregister_device(drvdata->imu_dev);
+            drvdata->imu_dev = NULL;
+        }
+    }
+    hid_hw_close(hdev);
+    hid_hw_stop(hdev);
 }
 
 static const struct hid_device_id nsl_sw001_devices[] = {
@@ -543,6 +984,7 @@ static struct hid_driver nsl_sw001_driver = {
     .name = "hid-nsl-sw001",
     .id_table = nsl_sw001_devices,
     .probe = nsl_sw001_probe,
+    .remove = nsl_sw001_remove,
     .report_fixup = nsl_sw001_report_fixup,
     .raw_event = nsl_sw001_raw_event,
     .input_mapping = nsl_sw001_input_mapping,
