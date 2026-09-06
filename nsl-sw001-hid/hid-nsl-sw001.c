@@ -8,6 +8,7 @@
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/math.h>
+#include <linux/workqueue.h>
 
 #define USB_VENDOR_ID_NINTENDO 0x057e
 #define USB_DEVICE_ID_PRO_CONTROLLER 0x2009
@@ -90,9 +91,141 @@
  *       blob/master/bluetooth_hid_notes.md
  */
 #define NSL_OUTPUT_RUMBLE_AND_SUBCMD   0x01
+#define NSL_OUTPUT_RUMBLE_ONLY         0x10
 #define NSL_INPUT_SUBCMD_REPLY         0x21
 #define NSL_INPUT_IMU_DATA             0x30
 #define NSL_SUBCMD_SPI_FLASH_READ      0x10
+#define NSL_SUBCMD_ENABLE_VIBRATION    0x48
+
+/*
+ * Rumble: the SW001 carries the same linear-actuator motors as a genuine
+ * Pro Controller and speaks the Nintendo HD-rumble protocol (verified
+ * physically: it vibrates).  Rumble goes out on the dedicated rumble-only
+ * output report 0x10 (8-byte rumble field, no subcmd) — the SW001 ACKs
+ * subcmd 0x48 (enable vibration) but ignores the rumble field of the
+ * rumble+subcmd report 0x01, so 0x10 is required.  It must be resent every
+ * ~50ms while an effect is active, since the controller only buzzes while
+ * packets keep arriving.  Encoding tables are from dekuNukem's
+ * rumble_data_table.md (same as upstream hid-nintendo).
+ */
+#define NSL_RUMBLE_DATA_SIZE     8
+#define NSL_RUMBLE_PERIOD_MS     50
+#define NSL_RUMBLE_ZERO_AMP_CNT  5
+#define NSL_RUMBLE_MAX_AMP       1003
+#define NSL_RUMBLE_DFLT_LOW_HZ   160
+#define NSL_RUMBLE_DFLT_HIGH_HZ  320
+#define NSL_RUMBLE_MIN_HIGH_HZ   82
+#define NSL_RUMBLE_MAX_HIGH_HZ   1253
+#define NSL_RUMBLE_MIN_LOW_HZ    41
+#define NSL_RUMBLE_MAX_LOW_HZ    626
+
+struct nsl_rumble_freq_data {
+    u16 high;
+    u8 low;
+    u16 freq; /* Hz */
+};
+
+struct nsl_rumble_amp_data {
+    u8 high;
+    u16 low;
+    u16 amp;
+};
+
+/* Frequency/amplitude lookup tables (dekuNukem rumble_data_table.md). */
+static const struct nsl_rumble_freq_data nsl_rumble_frequencies[] = {
+    { 0x0000, 0x01,   41 }, { 0x0000, 0x02,   42 }, { 0x0000, 0x03,   43 },
+    { 0x0000, 0x04,   44 }, { 0x0000, 0x05,   45 }, { 0x0000, 0x06,   46 },
+    { 0x0000, 0x07,   47 }, { 0x0000, 0x08,   48 }, { 0x0000, 0x09,   49 },
+    { 0x0000, 0x0A,   50 }, { 0x0000, 0x0B,   51 }, { 0x0000, 0x0C,   52 },
+    { 0x0000, 0x0D,   53 }, { 0x0000, 0x0E,   54 }, { 0x0000, 0x0F,   55 },
+    { 0x0000, 0x10,   57 }, { 0x0000, 0x11,   58 }, { 0x0000, 0x12,   59 },
+    { 0x0000, 0x13,   60 }, { 0x0000, 0x14,   62 }, { 0x0000, 0x15,   63 },
+    { 0x0000, 0x16,   64 }, { 0x0000, 0x17,   66 }, { 0x0000, 0x18,   67 },
+    { 0x0000, 0x19,   69 }, { 0x0000, 0x1A,   70 }, { 0x0000, 0x1B,   72 },
+    { 0x0000, 0x1C,   73 }, { 0x0000, 0x1D,   75 }, { 0x0000, 0x1e,   77 },
+    { 0x0000, 0x1f,   78 }, { 0x0000, 0x20,   80 }, { 0x0400, 0x21,   82 },
+    { 0x0800, 0x22,   84 }, { 0x0c00, 0x23,   85 }, { 0x1000, 0x24,   87 },
+    { 0x1400, 0x25,   89 }, { 0x1800, 0x26,   91 }, { 0x1c00, 0x27,   93 },
+    { 0x2000, 0x28,   95 }, { 0x2400, 0x29,   97 }, { 0x2800, 0x2a,   99 },
+    { 0x2c00, 0x2b,  102 }, { 0x3000, 0x2c,  104 }, { 0x3400, 0x2d,  106 },
+    { 0x3800, 0x2e,  108 }, { 0x3c00, 0x2f,  111 }, { 0x4000, 0x30,  113 },
+    { 0x4400, 0x31,  116 }, { 0x4800, 0x32,  118 }, { 0x4c00, 0x33,  121 },
+    { 0x5000, 0x34,  123 }, { 0x5400, 0x35,  126 }, { 0x5800, 0x36,  129 },
+    { 0x5c00, 0x37,  132 }, { 0x6000, 0x38,  135 }, { 0x6400, 0x39,  137 },
+    { 0x6800, 0x3a,  141 }, { 0x6c00, 0x3b,  144 }, { 0x7000, 0x3c,  147 },
+    { 0x7400, 0x3d,  150 }, { 0x7800, 0x3e,  153 }, { 0x7c00, 0x3f,  157 },
+    { 0x8000, 0x40,  160 }, { 0x8400, 0x41,  164 }, { 0x8800, 0x42,  167 },
+    { 0x8c00, 0x43,  171 }, { 0x9000, 0x44,  174 }, { 0x9400, 0x45,  178 },
+    { 0x9800, 0x46,  182 }, { 0x9c00, 0x47,  186 }, { 0xa000, 0x48,  190 },
+    { 0xa400, 0x49,  194 }, { 0xa800, 0x4a,  199 }, { 0xac00, 0x4b,  203 },
+    { 0xb000, 0x4c,  207 }, { 0xb400, 0x4d,  212 }, { 0xb800, 0x4e,  217 },
+    { 0xbc00, 0x4f,  221 }, { 0xc000, 0x50,  226 }, { 0xc400, 0x51,  231 },
+    { 0xc800, 0x52,  236 }, { 0xcc00, 0x53,  241 }, { 0xd000, 0x54,  247 },
+    { 0xd400, 0x55,  252 }, { 0xd800, 0x56,  258 }, { 0xdc00, 0x57,  263 },
+    { 0xe000, 0x58,  269 }, { 0xe400, 0x59,  275 }, { 0xe800, 0x5a,  281 },
+    { 0xec00, 0x5b,  287 }, { 0xf000, 0x5c,  293 }, { 0xf400, 0x5d,  300 },
+    { 0xf800, 0x5e,  306 }, { 0xfc00, 0x5f,  313 }, { 0x0001, 0x60,  320 },
+    { 0x0401, 0x61,  327 }, { 0x0801, 0x62,  334 }, { 0x0c01, 0x63,  341 },
+    { 0x1001, 0x64,  349 }, { 0x1401, 0x65,  357 }, { 0x1801, 0x66,  364 },
+    { 0x1c01, 0x67,  372 }, { 0x2001, 0x68,  381 }, { 0x2401, 0x69,  389 },
+    { 0x2801, 0x6a,  397 }, { 0x2c01, 0x6b,  406 }, { 0x3001, 0x6c,  415 },
+    { 0x3401, 0x6d,  424 }, { 0x3801, 0x6e,  433 }, { 0x3c01, 0x6f,  443 },
+    { 0x4001, 0x70,  452 }, { 0x4401, 0x71,  461 }, { 0x4801, 0x72,  470 },
+    { 0x4c01, 0x73,  479 }, { 0x5001, 0x74,  488 }, { 0x5401, 0x75,  497 },
+    { 0x5801, 0x76,  506 }, { 0x5c01, 0x77,  515 }, { 0x6001, 0x78,  524 },
+    { 0x6401, 0x79,  533 }, { 0x6801, 0x7a,  542 }, { 0x6c01, 0x7b,  551 },
+    { 0x7001, 0x7c,  560 }, { 0x7401, 0x7d,  569 }, { 0x7801, 0x7e,  578 },
+    { 0x7c01, 0x7f,  587 }, { 0x8001, 0x00,  596 }, { 0x8401, 0x00,  605 },
+    { 0x8801, 0x00,  614 }, { 0x8c01, 0x00,  623 }, { 0x9001, 0x00,  632 },
+    { 0x9401, 0x00,  641 }, { 0x9801, 0x00,  650 }, { 0x9c01, 0x00,  659 },
+    { 0xa001, 0x00,  668 }, { 0xa401, 0x00,  677 }, { 0xa801, 0x00,  686 },
+    { 0xac01, 0x00,  695 }, { 0xb001, 0x00,  704 }, { 0xb401, 0x00,  713 },
+    { 0xb801, 0x00,  722 }, { 0xbc01, 0x00,  731 }, { 0xc001, 0x00,  740 },
+    { 0xc401, 0x00,  749 }, { 0xc801, 0x00,  758 }, { 0xcc01, 0x00,  767 },
+    { 0xd001, 0x00,  776 }, { 0xd401, 0x00,  785 }, { 0xd801, 0x00,  794 },
+    { 0xdc01, 0x00,  803 }, { 0xe001, 0x00,  812 }, { 0xe401, 0x00,  821 },
+    { 0xe801, 0x00,  830 }, { 0xec01, 0x00,  839 }, { 0xf001, 0x00,  848 },
+    { 0xf401, 0x00,  857 }, { 0xf801, 0x00,  866 }, { 0xfc01, 0x00,  875 },
+};
+
+static const struct nsl_rumble_amp_data nsl_rumble_amplitudes[] = {
+    /* high, low, amp */
+    { 0x00, 0x0040,    0 },
+    { 0x02, 0x8040,   10 }, { 0x04, 0x0041,   12 }, { 0x06, 0x8041,   14 },
+    { 0x08, 0x0042,   17 }, { 0x0a, 0x8042,   20 }, { 0x0c, 0x0043,   24 },
+    { 0x0e, 0x8043,   28 }, { 0x10, 0x0044,   33 }, { 0x12, 0x8044,   40 },
+    { 0x14, 0x0045,   47 }, { 0x16, 0x8045,   56 }, { 0x18, 0x0046,   67 },
+    { 0x1a, 0x8046,   80 }, { 0x1c, 0x0047,   95 }, { 0x1e, 0x8047,  112 },
+    { 0x20, 0x0048,  117 }, { 0x22, 0x8048,  123 }, { 0x24, 0x0049,  128 },
+    { 0x26, 0x8049,  134 }, { 0x28, 0x004a,  140 }, { 0x2a, 0x804a,  146 },
+    { 0x2c, 0x004b,  152 }, { 0x2e, 0x804b,  159 }, { 0x30, 0x004c,  166 },
+    { 0x32, 0x804c,  173 }, { 0x34, 0x004d,  181 }, { 0x36, 0x804d,  189 },
+    { 0x38, 0x004e,  198 }, { 0x3a, 0x804e,  206 }, { 0x3c, 0x004f,  215 },
+    { 0x3e, 0x804f,  225 }, { 0x40, 0x0050,  230 }, { 0x42, 0x8050,  235 },
+    { 0x44, 0x0051,  240 }, { 0x46, 0x8051,  245 }, { 0x48, 0x0052,  251 },
+    { 0x4a, 0x8052,  256 }, { 0x4c, 0x0053,  262 }, { 0x4e, 0x8053,  268 },
+    { 0x50, 0x8054,  273 }, { 0x52, 0x0054,  279 }, { 0x54, 0x8054,  286 },
+    { 0x56, 0x0055,  292 }, { 0x58, 0x8055,  298 }, { 0x5a, 0x0056,  305 },
+    { 0x5c, 0x8056,  311 }, { 0x5e, 0x0057,  318 }, { 0x60, 0x8057,  325 },
+    { 0x62, 0x0058,  332 }, { 0x64, 0x8058,  340 }, { 0x66, 0x0059,  347 },
+    { 0x68, 0x8059,  355 }, { 0x6a, 0x005a,  362 }, { 0x6c, 0x805a,  370 },
+    { 0x6e, 0x805b,  378 }, { 0x70, 0x005c,  387 }, { 0x72, 0x805c,  395 },
+    { 0x74, 0x005d,  404 }, { 0x76, 0x805d,  413 }, { 0x78, 0x005e,  422 },
+    { 0x7a, 0x805e,  431 }, { 0x7c, 0x005f,  440 }, { 0x7e, 0x805f,  450 },
+    { 0x80, 0x0060,  460 }, { 0x82, 0x8060,  470 }, { 0x84, 0x0061,  480 },
+    { 0x86, 0x8061,  491 }, { 0x88, 0x0062,  501 }, { 0x8a, 0x8062,  512 },
+    { 0x8c, 0x0063,  524 }, { 0x8e, 0x8063,  535 }, { 0x90, 0x0064,  547 },
+    { 0x92, 0x8064,  559 }, { 0x94, 0x0065,  571 }, { 0x96, 0x8065,  584 },
+    { 0x98, 0x0066,  596 }, { 0x9a, 0x8066,  609 }, { 0x9c, 0x0067,  623 },
+    { 0x9e, 0x8067,  636 }, { 0xa0, 0x0068,  650 }, { 0xa2, 0x8068,  665 },
+    { 0xa4, 0x0069,  679 }, { 0xa6, 0x8069,  694 }, { 0xa8, 0x006a,  709 },
+    { 0xaa, 0x806a,  725 }, { 0xac, 0x006b,  741 }, { 0xae, 0x806b,  757 },
+    { 0xb0, 0x006c,  773 }, { 0xb2, 0x806c,  790 }, { 0xb4, 0x006d,  808 },
+    { 0xb6, 0x806d,  825 }, { 0xb8, 0x006e,  843 }, { 0xba, 0x806e,  862 },
+    { 0xbc, 0x006f,  881 }, { 0xbe, 0x806f,  900 }, { 0xc0, 0x0070,  920 },
+    { 0xc2, 0x8070,  940 }, { 0xc4, 0x0071,  960 }, { 0xc6, 0x8071,  981 },
+    { 0xc8, 0x0072, NSL_RUMBLE_MAX_AMP }
+};
 
 /* Minimum gap between BT output reports, mirroring hid-nintendo's
  * JC_SUBCMD_RATE_LIMITER_BT_MS.  Sending too fast disconnects the clone. */
@@ -146,6 +279,22 @@ struct nsl_sw001_data {
     s16 gyro_scale[3];
     s32 accel_divisor[3];
     s32 gyro_divisor[3];
+
+    /* Rumble state (output report 0x10 rumble field, resent ~50ms) */
+    struct hid_device *hdev;
+    u8 rumble_data[NSL_RUMBLE_DATA_SIZE];
+    unsigned int rumble_msecs;
+    u16 rumble_ll_freq;
+    u16 rumble_lh_freq;
+    u16 rumble_rl_freq;
+    u16 rumble_rh_freq;
+    unsigned short rumble_zero_countdown;
+    bool rumble_active;
+    /* Rumble output is sent from a workqueue, never from raw_event: the BT
+     * HIDP output path can block on the L2CAP socket lock, so sending
+     * synchronously from the input-report context deadlocks. */
+    struct workqueue_struct *rumble_wq;
+    struct work_struct rumble_work;
 
     /* Last BT output report timestamp, to throttle sends (see
      * nsl_enforce_output_rate). */
@@ -413,9 +562,11 @@ static int nsl_sw001_input_configured(struct hid_device *hdev,
  *   Ry = (data[10] >> 4) | (data[11] << 4)
  * and the newest IMU sample occupies data[37..48].
  */
+static void nsl_queue_rumble(struct nsl_sw001_data *drvdata);
+
 static int nsl_sw001_raw_event(struct hid_device *hdev,
-                               struct hid_report *report,
-                               u8 *data, int size)
+                                struct hid_report *report,
+                                u8 *data, int size)
 {
     unsigned int y, ry;
     struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
@@ -502,6 +653,30 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
         input_event(drvdata->imu_dev, EV_MSC, MSC_TIMESTAMP,
                     drvdata->imu_timestamp_us);
         input_sync(drvdata->imu_dev);
+    }
+
+    /*
+     * Resend rumble every ~50ms while the effect is held (rumble_active)
+     * or during the trailing zero-amp countdown used to stop the motors.
+     * The controller only buzzes while 0x10 rumble packets keep arriving,
+     * so this periodic resend from the streaming 0x30 reports is what
+     * sustains a held effect (the Switch streams continuously like this).
+     */
+    if (drvdata) {
+        unsigned long msecs = jiffies_to_msecs(jiffies);
+        unsigned long flags;
+
+        spin_lock_irqsave(&drvdata->lock, flags);
+        if ((msecs - drvdata->rumble_msecs) >= NSL_RUMBLE_PERIOD_MS &&
+            (drvdata->rumble_active || drvdata->rumble_zero_countdown > 0)) {
+            if (!drvdata->rumble_active && drvdata->rumble_zero_countdown > 0)
+                drvdata->rumble_zero_countdown--;
+            drvdata->rumble_msecs = msecs;
+            spin_unlock_irqrestore(&drvdata->lock, flags);
+            nsl_queue_rumble(drvdata);
+        } else {
+            spin_unlock_irqrestore(&drvdata->lock, flags);
+        }
     }
 
     return 0;
@@ -608,6 +783,148 @@ static int nsl_sw001_send_subcmd(struct hid_device *hdev,
     mutex_unlock(&drvdata->output_mutex);
 
     return ret;
+}
+
+/*
+ * Rumble-only output report (report id 0x10, no subcmd): what hid-nintendo
+ * sends for force feedback.  The 8-byte rumble field drives both linear
+ * motors, 4 bytes each (left then right).  The SW001 ACKs subcmd 0x48
+ * (enable vibration) but ignores the rumble field of report 0x01, so the
+ * dedicated 0x10 report is required.
+ */
+struct nsl_rumble_report {
+    u8 output_id;      /* 0x10 */
+    u8 packet_num;
+    u8 rumble_data[NSL_RUMBLE_DATA_SIZE];
+} __packed;
+
+static struct nsl_rumble_freq_data nsl_find_rumble_freq(u16 freq)
+{
+    const int length = ARRAY_SIZE(nsl_rumble_frequencies);
+    const struct nsl_rumble_freq_data *data = nsl_rumble_frequencies;
+    int i = 0;
+
+    if (freq > data[0].freq) {
+        for (i = 1; i < length - 1; i++) {
+            if (freq > data[i - 1].freq && freq <= data[i].freq)
+                break;
+        }
+    }
+    return data[i];
+}
+
+static struct nsl_rumble_amp_data nsl_find_rumble_amp(u16 amp)
+{
+    const int length = ARRAY_SIZE(nsl_rumble_amplitudes);
+    const struct nsl_rumble_amp_data *data = nsl_rumble_amplitudes;
+    int i = 0;
+
+    if (amp > data[0].amp) {
+        for (i = 1; i < length - 1; i++) {
+            if (amp > data[i - 1].amp && amp <= data[i].amp)
+                break;
+        }
+    }
+    return data[i];
+}
+
+static void nsl_encode_rumble(u8 *data, u16 freq_low, u16 freq_high, u16 amp)
+{
+    struct nsl_rumble_freq_data freq_l = nsl_find_rumble_freq(freq_low);
+    struct nsl_rumble_freq_data freq_h = nsl_find_rumble_freq(freq_high);
+    struct nsl_rumble_amp_data amp_d = nsl_find_rumble_amp(amp);
+
+    data[0] = (freq_h.high >> 8) & 0xFF;
+    data[1] = (freq_h.high & 0xFF) + amp_d.high;
+    data[2] = freq_l.low + ((amp_d.low >> 8) & 0xFF);
+    data[3] = amp_d.low & 0xFF;
+}
+
+/*
+ * Rumble output is sent from a dedicated workqueue (never from raw_event):
+ * on the Bluetooth HIDP path hid_hw_output_report can block on the L2CAP
+ * socket lock, so doing it synchronously while the input-report handler
+ * holds that path's locks deadlocks the HID thread.
+ */
+static void nsl_rumble_worker(struct work_struct *work);
+
+static void nsl_queue_rumble(struct nsl_sw001_data *drvdata)
+{
+    if (drvdata->rumble_wq)
+        queue_work(drvdata->rumble_wq, &drvdata->rumble_work);
+}
+
+static void nsl_rumble_worker(struct work_struct *work)
+{
+    struct nsl_sw001_data *drvdata =
+        container_of(work, struct nsl_sw001_data, rumble_work);
+    struct nsl_rumble_report rpt;
+    unsigned long flags;
+
+    rpt.output_id = NSL_OUTPUT_RUMBLE_ONLY;
+    rpt.packet_num = drvdata->subcmd_num;
+    if (++drvdata->subcmd_num > 0xF)
+        drvdata->subcmd_num = 0;
+
+    spin_lock_irqsave(&drvdata->lock, flags);
+    memcpy(rpt.rumble_data, drvdata->rumble_data, NSL_RUMBLE_DATA_SIZE);
+    spin_unlock_irqrestore(&drvdata->lock, flags);
+
+    nsl_enforce_output_rate(drvdata);
+    mutex_lock(&drvdata->output_mutex);
+    hid_hw_output_report(drvdata->hdev, (u8 *)&rpt, sizeof(rpt));
+    mutex_unlock(&drvdata->output_mutex);
+}
+
+/*
+ * Encode a new rumble state into drvdata->rumble_data and queue a send.
+ * amp_r is the right motor, amp_l the left, each 0..65535.  Any nonzero
+ * amplitude arms the zero-amp countdown so the periodic resend (from
+ * raw_event) keeps the motors buzzing while an effect holds; a zero-amp
+ * stop keeps sending silence briefly so the motors fully stop.
+ */
+static int nsl_set_rumble(struct nsl_sw001_data *drvdata,
+                          u16 amp_r, u16 amp_l)
+{
+    u8 data[NSL_RUMBLE_DATA_SIZE];
+    u16 amp;
+    unsigned long flags;
+
+    /* right motor at data+4, left motor at data+0 */
+    amp = amp_r * (u32)NSL_RUMBLE_MAX_AMP / 65535;
+    nsl_encode_rumble(data + 4, drvdata->rumble_rl_freq,
+                      drvdata->rumble_rh_freq, amp);
+    amp = amp_l * (u32)NSL_RUMBLE_MAX_AMP / 65535;
+    nsl_encode_rumble(data, drvdata->rumble_ll_freq,
+                      drvdata->rumble_lh_freq, amp);
+
+    spin_lock_irqsave(&drvdata->lock, flags);
+    memcpy(drvdata->rumble_data, data, NSL_RUMBLE_DATA_SIZE);
+    if (amp_l != 0 || amp_r != 0) {
+        drvdata->rumble_active = true;
+        drvdata->rumble_zero_countdown = NSL_RUMBLE_ZERO_AMP_CNT;
+    } else if (drvdata->rumble_active) {
+        /* zero-amp stop: keep sending silence briefly so motors fully stop */
+        drvdata->rumble_active = false;
+        drvdata->rumble_zero_countdown = NSL_RUMBLE_ZERO_AMP_CNT;
+    }
+    spin_unlock_irqrestore(&drvdata->lock, flags);
+
+    nsl_queue_rumble(drvdata);
+    return 0;
+}
+
+static int nsl_sw001_play_effect(struct input_dev *dev, void *data,
+                                 struct ff_effect *effect)
+{
+    struct nsl_sw001_data *drvdata = data;
+
+    if (effect->type != FF_RUMBLE)
+        return 0;
+
+    return nsl_set_rumble(drvdata,
+                          effect->u.rumble.weak_magnitude,   /* right */
+                          effect->u.rumble.strong_magnitude); /* left */
 }
 
 /*
@@ -874,6 +1191,20 @@ static int nsl_sw001_probe(struct hid_device *hdev,
     init_waitqueue_head(&drvdata->wait);
     spin_lock_init(&drvdata->lock);
 
+    /* Rumble defaults + state */
+    drvdata->hdev = hdev;
+    drvdata->rumble_ll_freq = NSL_RUMBLE_DFLT_LOW_HZ;
+    drvdata->rumble_lh_freq = NSL_RUMBLE_DFLT_HIGH_HZ;
+    drvdata->rumble_rl_freq = NSL_RUMBLE_DFLT_LOW_HZ;
+    drvdata->rumble_rh_freq = NSL_RUMBLE_DFLT_HIGH_HZ;
+    drvdata->rumble_msecs = jiffies_to_msecs(jiffies);
+    drvdata->rumble_wq = alloc_workqueue("hid-nsl-sw001-rumble", 0, 0);
+    if (!drvdata->rumble_wq) {
+        hid_err(hdev, "failed to allocate rumble workqueue\n");
+        return -ENOMEM;
+    }
+    INIT_WORK(&drvdata->rumble_work, nsl_rumble_worker);
+
     /* Seed calibration with defaults in case the SPI read fails */
     {
         int i;
@@ -941,6 +1272,34 @@ static int nsl_sw001_probe(struct hid_device *hdev,
     }
 
     /*
+     * Register force-feedback (rumble) on the gamepad node.  gamepad_dev is
+     * populated by input_configured during hid_hw_start; play_effect reads
+     * drvdata via the memless `data` arg.
+     */
+    if (drvdata->gamepad_dev) {
+        input_set_capability(drvdata->gamepad_dev, EV_FF, FF_RUMBLE);
+        ret = input_ff_create_memless(drvdata->gamepad_dev, drvdata,
+                                      nsl_sw001_play_effect);
+        if (ret) {
+            hid_err(hdev, "failed to create FF memless effect; ret=%d\n", ret);
+            hid_hw_close(hdev);
+            hid_hw_stop(hdev);
+            return ret;
+        }
+
+        /* Enable the motors (subcmd 0x48 with data 0x01). */
+        ret = nsl_sw001_send_subcmd(hdev, drvdata,
+                                    NSL_SUBCMD_ENABLE_VIBRATION,
+                                    (u8[]){ 0x01 }, 1, HZ / 4);
+        if (ret)
+            hid_warn(hdev, "failed to enable rumble; ret=%d\n", ret);
+        else
+            hid_info(hdev, "rumble enabled (vibration subcmd ACKed)\n");
+    } else {
+        hid_warn(hdev, "no gamepad node, skipping rumble setup\n");
+    }
+
+    /*
      * Read the IMU calibration from SPI flash.  Best-effort: short
      * timeouts, no retries, falls back to defaults on any failure so the
      * probe cannot stall the HIDP teardown path.
@@ -955,6 +1314,10 @@ static void nsl_sw001_remove(struct hid_device *hdev)
     struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
 
     if (drvdata) {
+        /* Wake any blocked synchronous waiter before tearing down */
+        drvdata->received_resp = true;
+        wake_up(&drvdata->wait);
+
         /*
          * The IMU device is registered separately from hid-input; hid core
          * only tears down the gamepad nodes, so unregister it here or it
@@ -968,6 +1331,10 @@ static void nsl_sw001_remove(struct hid_device *hdev)
     }
     hid_hw_close(hdev);
     hid_hw_stop(hdev);
+    /* No more raw_events after hid_hw_stop, so it is safe to flush queued
+     * rumble sends (they now fail harmlessly on the stopped device). */
+    if (drvdata && drvdata->rumble_wq)
+        destroy_workqueue(drvdata->rumble_wq);
 }
 
 static const struct hid_device_id nsl_sw001_devices[] = {
