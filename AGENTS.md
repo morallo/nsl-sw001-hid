@@ -73,7 +73,7 @@ output of journalctl after connecting the controller with hid-generic
                          
 # Current project status
 
-Custom driver in nsl-sw001-hid/hid-nsl-sw001.c makes the controller work via bluetooth with hid-nintendo excluded. All axes and buttons work. IMU data provided in a separate device similar to what Nintendo does.
+Custom driver in nsl-sw001-hid/hid-nsl-sw001.c makes the controller work via bluetooth with hid-nintendo excluded. All axes, buttons, IMU (separate device, factory-calibrated) and rumble (evdev FF) work.
 Compatible with SDL only with a custom SDL_GAMECONTROLLERCONFIG. Without it, it needs a manual re-mapping through the UI.
 
 ## Working
@@ -95,20 +95,35 @@ Compatible with SDL only with a custom SDL_GAMECONTROLLERCONFIG. Without it, it 
   - Why only the IMU node needs its own rule: it is `ID_INPUT_ACCELEROMETER` (not `ID_INPUT_JOYSTICK`, and not a hidraw node), so neither systemd's generic joystick uaccess line nor Steam's `057E:2009` hidraw rule tags it. Genuine Pro Controllers avoid the issue because SDL/Steam use HIDAPI over hidraw for them, not evdev.
   - Wired into the Steam Deck installer: `install-nsl-sw001-deck.sh` installs it, seeds it under `/home/.steamos-nsl-sw001/etc/`, `steamos-nsl-ensure.sh` re-asserts it at every boot, and it is added to `atomic-update-additional-keep-list.conf` so it survives SteamOS A/B updates. Verified: `SDL_GamepadHasSensor`/`SDL_GetGamepadSensorData` work and Steam Input gyro is usable.
 
-## Rumble
+## Rumble (WORKING, verified 2026-09-06)
 
-- **Rumble via evdev FF implemented but does not work on SW001):** the SW001 carries genuine HD-rumble linear motors (seen to vibrate on Switch/Android). The custom driver registers `EV_FF / FF_RUMBLE` on the gamepad node via `input_ff_create_memless` (memless `data` arg carries `drvdata`, so it does not depend on `input_set_drvdata` being left intact by hid-core), with the dekuNukem freq/amp lookup tables and `encode_rumble` copied verbatim from upstream hid-nintendo. Rumble is sent as the 8-byte rumble field of output report **0x01** (rumble + subcmd, 49-byte padded, no subcmd byte), matching the SW001's requirement for full 49-byte output reports; hid-nintendo's rumble-only 0x10 report is not used. A probe subcmd 0x48 (enable vibration, data 0x01) is attempted but non-fatal if the clone ignores it. Immediate send from `play_effect` + a ~50ms periodic resend from `raw_event` (sustained only while the app re-triggers the effect, mirroring hid-nintendo; the zero-amp countdown lets motors fully stop).
+The SW001 carries genuine HD-rumble linear motors (they vibrate on Switch; on Android only as the brief autonomous power-on buzz — Android shows no rumble capability, see the resolved "protocol hunt" TODO).
+
+Verified protocol facts:
+- The controller **ACKs subcmd `0x48` (enable vibration)** but **ignores the 8-byte rumble field of output report `0x01`** (tested: 49-byte padded 0x01 burst at full amplitude, no vibration).
+- It **does drive the motors with hid-nintendo's dedicated rumble-only output report `0x10`** (`{0x10, packet_num, rumble_data[8]}` = 10 bytes, `struct nsl_rumble_report`) — verified: strong sustained vibration.
+
+Driver implementation (committed `6148413`, report 0x10 only):
+- `input_ff_create_memless(gamepad_dev, drvdata, nsl_sw001_play_effect)` on the gamepad node; `play_effect` gets `drvdata` from the memless `data` arg (not `input_set_drvdata`, which hid-core leaves dirty). `weak_magnitude` → right motor, `strong_magnitude` → left.
+- dekuNukem freq/amp lookup tables + `nsl_encode_rumble` copied from upstream hid-nintendo (`nsl_find_rumble_freq`, `nsl_find_rumble_amp`).
+- Rumble is sent from a **dedicated workqueue** (`nsl_rumble_wq`, `alloc_workqueue` in probe, `destroy_workqueue` in remove), **never from `raw_event`**: BT HIDP output can block on the L2CAP socket lock, so sending from the input-path context deadlocks the HID thread.
+- A ~50ms periodic resend from `raw_event` sustains a held effect, and a trailing **zero-amp countdown** (`NSL_RUMBLE_ZERO_AMP_CNT 5`) fully stops the motors — the SW001 only buzzes while 0x10 packets keep arriving, and a single "stop" packet is NOT enough (verified: the one-shot test left it buzzing until power-off; the FF machinery stops it cleanly).
+- `NSL_SUBCMD_ENABLE_VIBRATION` (`0x48`, data `0x01`) is sent at probe; ack is logged, failure is non-fatal.
+- The `0x10` output report does NOT need to be declared in the report descriptor: `hid_hw_output_report` (BT hidp) passes the raw buffer straight through.
+
+Note: this is generic `FF_RUMBLE` (sine-approx frequencies from the tables), not the Switch's HD-rumble waveforms; the motors are capable, but matching genuine HD-rumble envelopes would need per-waveform dumping not available on PC.
 
 ## TO DO
 
-- **Capture device without globally disabling hid-nintendo**. Options to consider:
-  - Using a udev rule to unbind the device from hid-nintendo.
-  - hid core
-  - Spoofing the VID/PID at bluetooth HID transport
+- **Capture/screenshot button is not registered by Steam.** The evdev node (hid-nintendo) reports it as BTN_Z (309) fine; Steam's SDL uses its built-in Switch Pro mapping (GUID `0500d71f7e0500000920000001800000`, `hint:!SDL_GAMECONTROLLER_USE_BUTTON_LABELS`) which has NO `misc1:` binding, so the Capture button is invisible to Steam Input.
+
+- **IMU calibration data is wrong** — **FIXED (2026-09-07, hid-bpf):** hid-nintendo was taking the user-cal path because the SW001 serves the `B2 A1` user-cal magic at SPI 0x8026 on the wire plus garbage user data at 0x8028, and the BPF was only faking stick-cal SPI reads. `nsl-sw001.bpf.c` now also fakes the IMU SPI reads: 0x8026 is answered with NO magic (both hid-nintendo and SDL HIDAPI take the factory path), and 0x6020/0x8028 are answered with the SW001's real factory cal captured in `bluetooth_captures/sw001_calibration_0x6020.md` (gyro scale 15335). Same fix steers SDL's HIDAPI Switch driver (which reads 0x6020 + 0x8026, checks the same magic, and used to override the factory scale with garbage).
+
+- **`joycon_enforce_subcmd_rate: exceeded max attempts` spam on every rumble activation** (`sept. 07 01:13:31 ... 0015`). Rumble works, but the kernel logs these each time rumble is activated.
 
 - ~~**Apply the factory calibration data**~~ **DONE (2026-09-06):** the kernel driver now reads the factory IMU calibration from SPI flash at connect and applies it in `raw_event` (gyro scale 15335, not the 13371 default). The long-standing `ret=-110` root cause was NOT the wire format: it was that the synchronous subcmd read ran inside `probe()` while `hid_device_probe()` holds `driver_input_lock`, so `__hid_input_report()`'s `down_trylock()` failed and the 0x21 reply was dropped before `raw_event`. Fixed by calling `hid_device_io_start(hdev)` right after `hid_hw_open()` (same as hid-nintendo line 2249). Two supporting rdesc changes were also required and kept: (1) declare input report `0x21` (48 Const bytes) so `hid_get_report()` routes the reply to `raw_event`; (2) output report `0x01` declared/sent at the natural 16 bytes (the Android 17 capture shows the SW001 answers SHORT subcmd reports, not the genuine 49-byte padded form). The `a2 80 02` USB handshake probe was tested and is NOT required.
 
-- **Rumble protocol hunt** The Android capture (`btsnoop_hci_rumble.log`) turns out to be ONLY ~21 ms of connection setup on the SW001 (handle 0x0c): L2CAP signaling on cid 0x0001 + 8 host->controller reports on HID Control cid 0x0041. There is NO interrupt channel (0x43) traffic and NO `a1 30` input stream in the file — so it contains no application-session rumble at all. The 8 `a2` reports are all `a2 01 <ctr> [8 zero bytes] <trailing 10 xx 80 ...>` (e.g. `a2 01 02 00 00 00 00 00 00 00 00 10 12 80 00 00 09`, repeated ctrs), i.e. NOT rumble and NOT a standard Nintendo subcmd report — they look like SPI/calibration reads done during host init. Crucially, **Android apps do not report/detect rumble capability at all, and the only motor activity is a brief autonomous buzz on connect** (the controller's own power-on self-test / LED-motor blip, not host-requested). So there is NO Android rumble output to reverse-engineer; the earlier premise ("since rumble WORKS on Android, capture its protocol") is false. The clone's connect-buzz is self-generated and not reproducible from a host output report. Implication for driver rumble: unknown whether the SW001 accepts ANY host rumble command. If pursuing further, would need a host that exposes real rumble to the SW001 (e.g. a Switch, or SDL forcing HIDAPI rumble on hidraw) to see if any 0x01/other report ever produces motor motion; otherwise rumble stays unimplemented. 0x48 enable already known non-fatal.
+- ~~**Rumble protocol hunt**~~ **RESOLVED (2026-09-06):** the Android capture turned out to be ONLY ~21 ms of connection setup on the SW001 (handle 0x0c): L2CAP signaling on cid 0x0001 + 8 host->controller reports on HID Control cid 0x0041. There is NO interrupt channel (0x43) traffic and NO `a1 30` input stream in the file — so it contains no application-session rumble at all. The 8 `a2` reports are all `a2 01 <ctr> [8 zero bytes] <trailing 10 xx 80 ...>` (e.g. `a2 01 02 00 00 00 00 00 00 00 00 10 12 80 00 00 09`, repeated ctrs), i.e. NOT rumble and NOT a standard Nintendo subcmd report — they look like SPI/calibration reads done during host init. Crucially, **Android apps do not report/detect rumble capability at all, and the only motor activity is a brief autonomous buzz on connect** (the controller's own power-on self-test / LED-motor blip, not host-requested). So there is NO Android rumble output to reverse-engineer; the earlier premise ("since rumble WORKS on Android, capture its protocol") is false. The clone's connect-buzz is self-generated and not reproducible from a host output report. The remaining open question ("does the SW001 accept ANY host rumble command?") was answered by direct PC testing: the **0x01 rumble field is ignored, but the dedicated rumble-only report `0x10` drives the motors** — rumble is now implemented and working in the driver (see the Rumble section above). The original speculation ("would need a Switch, or SDL forcing HIDAPI rumble on hidraw") was not needed.
 
 # Diagnostic / reload notes
 
