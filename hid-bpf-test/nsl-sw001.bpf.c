@@ -64,7 +64,29 @@ static bool sw001_is_clone;
  * keeps map->usercnt > 0 (bpf_wq_init returns -EPERM otherwise), so the wq
  * survives the one-shot loader exiting.
  */
-#define NSL_RUMBLE_ZERO_TOTAL	20	/* zero packets on a stop, incl. the first */
+#ifndef NSL_RUMBLE_ZERO_TOTAL
+/* Zero packets on a stop, incl. the first. The reliable dimension is the
+ * SPAN of distinct sampling instances, not the packet count: 1 per tick,
+ * TOTAL=20 (~200 ms) stopped every time. ZPT=2 with the same TOTAL shrank
+ * the span to ~10 instances -> 95%. To go fast AND keep the span, raise
+ * TOTAL instead, e.g. ZPT=2, TOTAL=36 = 17 pair-phases (~200 ms, denser
+ * early coverage). */
+#define NSL_RUMBLE_ZERO_TOTAL	36
+#endif
+/* Compile-time knob: pass BPF_CFLAGS=-DNSL_RUMBLE_STOP_CASCADE=0 to disable
+ * the paced stop cascade entirely, leaving only SDL's single neutral write
+ * (i.e. the pre-fix "stuck" behavior). The wq init and the short report
+ * translation stay in the build either way. */
+#ifndef NSL_RUMBLE_STOP_CASCADE
+#define NSL_RUMBLE_STOP_CASCADE 1
+#endif
+/* Zero reports per 0x30 tick while a stop is pending, 1..NSL_RUMBLE_ZERO_TOTAL.
+ * 1 per tick with TOTAL=20 was the verified-reliable baseline (~200 ms).
+ * 2 halves the number of distinct tick instances for a given TOTAL, so only
+ * combine it with a raised NSL_RUMBLE_ZERO_TOTAL (see above). */
+#ifndef NSL_ZEROS_PER_TICK
+#define NSL_ZEROS_PER_TICK 2
+#endif
 
 struct rumble_state {
 	struct bpf_wq wq;		/* stays live for session lifetime */
@@ -242,8 +264,9 @@ int BPF_PROG(sw001_fix_rdesc, struct hid_bpf_ctx *hctx)
  * requested address/length with canned, plausible calibration data.
  *
  * Covered areas:
- *   - stick user/factory cal (all stick axes at 2048 center / 3072 max /
- *     1024 min, which also passes hid-nintendo's min<center<max sanity check)
+ *   - stick user/factory cal (deltas matching the measured raw ranges:
+ *     center 2048, X max-above 2036 / min-below 2048, Y max-above 2047 /
+ *     min-below 2037, which also passes hid-nintendo's min<center<max check)
  *   - IMU factory cal 0x6020 (real SW001 values captured from the Android
  *     17 session) and IMU user magic 0x8026 (answered with NO B2 A1 magic).
  *     Without the IMU fakes the SW001 serves the B2 A1 user-cal magic on the
@@ -268,29 +291,45 @@ int BPF_PROG(sw001_fix_rdesc, struct hid_bpf_ctx *hctx)
 #define NSL_SPI_IMU_USER_MAGIC		0x8026
 #define NSL_SPI_IMU_USER_DATA		0x8028
 
-/* 12-bit values packed as pairs sharing a nibble byte; see SDL's
+/* IMPORTANT: the max/min fields are DELTAS above/below center, not
+ * absolute positions. hid-nintendo's joycon_read_stick_calibration computes
+ * cal->max = center + max_above and cal->min = center - min_below (SDL
+ * HIDAPI reads them the same way). The earlier blobs shipped absolute
+ * values (max 0xC00, min 0x400) -> consumers computed max = 2048+3072 =
+ * 5120, so the positive branch of joycon_map_stick_val divided by 3072 while
+ * the negative branch divided by 1024. Result (matches field reports): up and
+ * right topped out at ~66% (2047*32767/3072 = 21820) while down and left
+ * clamped to 100%.
+ *
+ * The deltas below are the raw values MEASURED on this SW001 unit
+ * (diagnostic_scripts/oneshot_raw.py): X sweeps 0..4084, Y sweeps 11..4095,
+ * rest centered at 2048. Both sticks measured identically, so one left/right
+ * pair serves both.
+ *
+ * 12-bit values packed as pairs sharing a nibble byte; see SDL's
  * SwitchLoadCalibration / hid-nintendo's joycon_read_stick_calibration.
- * Left order: max, center, min. Right order: center, min, max. */
+ * Left order: max-above, center, min-below. Right order: center, min-below,
+ * max-above. */
 static const __u8 sw001_cal_magic[2] = { 0xb2, 0xa1 };
 static const __u8 sw001_cal_left[9] = {
-	0x00, 0x0c, 0xc0,	/* X/Y max   0xC00 */
+	0xf4, 0xf7, 0x7f,	/* X max above 2036, Y max above 2047 */
 	0x00, 0x08, 0x80,	/* X/Y center 0x800 */
-	0x00, 0x04, 0x40,	/* X/Y min   0x400 */
+	0x00, 0x58, 0x7f,	/* X min below 2048, Y min below 2037 */
 };
 static const __u8 sw001_cal_right[9] = {
 	0x00, 0x08, 0x80,	/* X/Y center 0x800 */
-	0x00, 0x04, 0x40,	/* X/Y min   0x400 */
-	0x00, 0x0c, 0xc0,	/* X/Y max   0xC00 */
+	0x00, 0x58, 0x7f,	/* X min below 2048, Y min below 2037 */
+	0xf4, 0xf7, 0x7f,	/* X max above 2036, Y max above 2047 */
 };
 static const __u8 sw001_user_cal_blob[22] = {
 	0xb2, 0xa1,
-	0x00, 0x0c, 0xc0, 0x00, 0x08, 0x80, 0x00, 0x04, 0x40,
+	0xf4, 0xf7, 0x7f, 0x00, 0x08, 0x80, 0x00, 0x58, 0x7f,
 	0xb2, 0xa1,
-	0x00, 0x08, 0x80, 0x00, 0x04, 0x40, 0x00, 0x0c, 0xc0,
+	0x00, 0x08, 0x80, 0x00, 0x58, 0x7f, 0xf4, 0xf7, 0x7f,
 };
 static const __u8 sw001_factory_cal_blob[18] = {
-	0x00, 0x0c, 0xc0, 0x00, 0x08, 0x80, 0x00, 0x04, 0x40,
-	0x00, 0x08, 0x80, 0x00, 0x04, 0x40, 0x00, 0x0c, 0xc0,
+	0xf4, 0xf7, 0x7f, 0x00, 0x08, 0x80, 0x00, 0x58, 0x7f,
+	0x00, 0x08, 0x80, 0x00, 0x58, 0x7f, 0xf4, 0xf7, 0x7f,
 };
 
 /* SW001 factory IMU calibration (SPI 0x6020), captured from the Android 17
@@ -358,6 +397,7 @@ int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 			 * form, i.e. today's behavior) rather than dropping it. */
 			return 0;
 
+		#if NSL_RUMBLE_STOP_CASCADE
 		if (st && st->inited && st->cb_ready) {
 			bool zero_amp;
 			__u8 i;
@@ -385,6 +425,7 @@ int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 				st->stop_countdown = 0;
 			}
 		}
+#endif
 
 		return hctx->size;
 	}
@@ -477,8 +518,15 @@ int BPF_PROG(sw001_tick_stop, struct hid_bpf_ctx *hctx,
 	if (!st || !st->inited || !st->cb_ready || st->stop_countdown == 0)
 		return 0;
 
-	st->stop_countdown--;
-	bpf_wq_start(&st->wq, 0);
+	{
+		__u8 i;
+		__u8 n = st->stop_countdown < NSL_ZEROS_PER_TICK ?
+			    st->stop_countdown : (__u8)NSL_ZEROS_PER_TICK;
+
+		st->stop_countdown -= n;
+		for (i = 0; i < n; i++)
+			bpf_wq_start(&st->wq, 0);
+	}
 
 	return 0;
 }

@@ -1,0 +1,27 @@
+# SteamOS ensure service for the N-SL SW001 HID-BPF program.
+#
+# Runs at boot to re-install the program after a SteamOS A/B update (which
+# replaces /usr and prunes /etc).  Everything is re-seeded from a persistent
+# copy under /home/.steamos-nsl-sw001-bpf/.
+#
+# Enabled by the installer (and re-enabled by the ensure script itself, since
+# /etc and /usr may be fresh after an update).
+[Unit]
+Description=Ensure N-SL SW001 HID-BPF program is installed
+# Before the desktop session so the controller is ready in Game Mode.
+Before=systemd-user-sessions.service
+After=local-fs.target
+ConditionPathExists=/home/.steamos-nsl-sw001-bpf/steamos-nsl-sw001-bpf-ensure.sh
+
+[Service]
+Type=oneshot
+ExecStart=/home/.steamos-nsl-sw001-bpf/steamos-nsl-sw001-bpf-ensure.sh
+RemainAfterExit=yes
+TimeoutStartSec=300
+# Tmpfiles, udev and bluetooth may not be ready yet; keep the attach step
+# until after they settle.
+After=systemd-udevd.service systemd-tmpfiles-setup.service bluetooth.service
+RequiresMountsFor=/home
+
+[Install]
+WantedBy=multi-user.target

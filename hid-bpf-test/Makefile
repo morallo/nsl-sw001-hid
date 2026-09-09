@@ -1,0 +1,60 @@
+CLANG ?= clang
+CLANG_STRIP ?= llvm-strip
+CFLAGS ?= -O2 -Wall
+BPF_CFLAGS ?= -O2 -g -Wall
+
+# Defaults: paced zero stop cascade on (NSL_RUMBLE_STOP_CASCADE=1), 36 zero
+# packets (NSL_RUMBLE_ZERO_TOTAL=36) delivered 2 per 0x30 tick
+# (NSL_ZEROS_PER_TICK=2): a ~200 ms span of pair-spaced zeros, denser early
+# than the proven 1-per-tick baseline. The proven-reliable profile is
+# `make NSL_RUMBLE_ZERO_TOTAL=20 NSL_ZEROS_PER_TICK=1`. Override with
+# `make NSL_RUMBLE_STOP_CASCADE=0` to disable the cascade entirely.
+ifdef NSL_RUMBLE_STOP_CASCADE
+BPF_CFLAGS += -DNSL_RUMBLE_STOP_CASCADE=$(NSL_RUMBLE_STOP_CASCADE)
+endif
+ifdef NSL_ZEROS_PER_TICK
+BPF_CFLAGS += -DNSL_ZEROS_PER_TICK=$(NSL_ZEROS_PER_TICK)
+endif
+ifdef NSL_RUMBLE_ZERO_TOTAL
+BPF_CFLAGS += -DNSL_RUMBLE_ZERO_TOTAL=$(NSL_RUMBLE_ZERO_TOTAL)
+endif
+
+.PHONY: all clean deps inspect install uninstall
+
+all: nsl-sw001.bpf.o
+
+deps:
+	@for c in $(CLANG) $(CLANG_STRIP) gcc; do \
+		command -v $$c >/dev/null 2>&1 || \
+			{ echo "MISSING: $$c"; exit 1; }; \
+	done
+	@test -r /sys/kernel/btf/vmlinux || { echo "MISSING: /sys/kernel/btf/vmlinux (CONFIG_DEBUG_INFO_BTF)"; exit 1; }
+	@command -v udev-hid-bpf >/dev/null 2>&1 || \
+		{ echo "MISSING: udev-hid-bpf — dnf install udev-hid-bpf"; exit 1; }
+	@echo "toolchain ok (no bpftool needed)"
+
+tools/gen_vmlinux_h: tools/gen_vmlinux_h.c
+	$(CC) $(CFLAGS) -o $@ $< -lbpf
+
+vmlinux.h: tools/gen_vmlinux_h
+	./$< > $@
+
+nsl-sw001.bpf.o: nsl-sw001.bpf.c vmlinux.h vendor/hid_bpf.h vendor/hid_bpf_helpers.h vendor/hid_report_descriptor_helpers.h
+	$(CLANG) $(BPF_CFLAGS) -target bpf -D__TARGET_ARCH_x86 \
+		-Ivendor -I. -c $< -o $@
+	$(CLANG_STRIP) -g $@
+
+inspect: nsl-sw001.bpf.o
+	udev-hid-bpf inspect nsl-sw001.bpf.o
+
+install: deps nsl-sw001.bpf.o
+	sudo udev-hid-bpf install --dry-run nsl-sw001.bpf.o
+	@echo "--- dry run ok, real install:"
+	sudo udev-hid-bpf install nsl-sw001.bpf.o
+
+uninstall:
+	sudo rm -f /etc/udev/rules.d/*nsl-sw001* /etc/udev-hid-bpf/*nsl-sw001*
+	@echo "removed installed udev rule + program for nsl-sw001"
+
+clean:
+	rm -f nsl-sw001.bpf.o vmlinux.h tools/gen_vmlinux_h

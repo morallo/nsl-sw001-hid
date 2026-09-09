@@ -117,6 +117,17 @@ produces the same `vmlinux.h`.
 make uninstall        # removes /etc/udev/rules.d/*nsl-sw001* and /etc/udev-hid-bpf/*
 ```
 
+## Steam Deck (SteamOS) deployment
+
+`steamdeck/` packages the prebuilt object for the Deck: an installer
+(`install-nsl-sw001-bpf-deck.sh`) that installs the `udev-hid-bpf` loader and
+the udev rule + program, seeds a persistent copy under
+`/home/.steamos-nsl-sw001-bpf/` and wires the ensure service + atomic-update
+keep-list so it survives A/B updates.  It also removes the old kernel-module
+route if present (its `hid_nintendo` blacklist and `SDL_HIDAPI_IGNORE_DEVICES`
+would defeat the BPF route).  No build happens on the Deck — see
+`steamdeck/README-deck.md`.
+
 ## Known limits of the BPF approach
 
 - The **separate "Pro Controller IMU" evdev node and `FF_RUMBLE`** are created
