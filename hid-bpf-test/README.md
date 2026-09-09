@@ -52,7 +52,9 @@ the stock descriptor should be the entire missing piece.
      as a 9-byte output report so the kfunc's report lookup/clamping matches
      (`hid_report_len` = 10). SDL's periodic refresh keeps re-sending while the
      effect is held, so the ~50 ms resend the SW001 needs is preserved.
-3. **`probe`** (syscall) — always matches; required by the udev-hid-bpf loader.
+3. **`probe`** (syscall) — always matches; the loader runs it before attach
+    (udev-hid-bpf or `steamdeck/sw001-bpf-attach`) so it can stash the numeric
+    hid id in the rumble map for the workqueue callback.
 
 hid-nintendo then does all the rest itself: gamepad + IMU input devices,
 factory IMU calibration (gyro scale 15335, from the faked `0x6020` read),
@@ -119,13 +121,15 @@ make uninstall        # removes /etc/udev/rules.d/*nsl-sw001* and /etc/udev-hid-
 
 ## Steam Deck (SteamOS) deployment
 
-`steamdeck/` packages the prebuilt object for the Deck: an installer
-(`install-nsl-sw001-bpf-deck.sh`) that installs the `udev-hid-bpf` loader and
-the udev rule + program, seeds a persistent copy under
-`/home/.steamos-nsl-sw001-bpf/` and wires the ensure service + atomic-update
-keep-list so it survives A/B updates.  It also removes the old kernel-module
-route if present (its `hid_nintendo` blacklist and `SDL_HIDAPI_IGNORE_DEVICES`
-would defeat the BPF route).  No build happens on the Deck — see
+`steamdeck/` packages the prebuilt object for the Deck with a **self-contained
+loader** (`sw001-bpf-attach`, built off-Deck by `make deck-bundle`) instead of
+the `udev-hid-bpf` pacman package: no pacman, no `steamos-readonly` unlock, and
+no reinstall after A/B updates (loader + bundled `.so`s + object live under
+`/home`, which SteamOS never prunes).  The installer writes the udev rule +
+ensure unit to `/etc` (both on the atomic-update keep-list), seeds
+`/home/.steamos-nsl-sw001-bpf/` and removes the old kernel-module route if
+present (its `hid_nintendo` blacklist and `SDL_HIDAPI_IGNORE_DEVICES` would
+defeat the BPF route).  No build happens on the Deck — see
 `steamdeck/README-deck.md`.
 
 ## Known limits of the BPF approach

@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 #
-# Self-seeding ensure script for the N-SL SW001 HID-BPF program on SteamOS.
+# Boot-time re-assert script for the N-SL SW001 HID-BPF program on SteamOS.
 #
 # Persistence model:
-#   - SteamOS replaces /usr (root) on every A/B update, wiping the udev-hid-bpf
-#     loader, and /etc keeps only files on the atomic-update keep-list.  /home
-#     is never touched.
-#   - The BPF program is a single prebuilt object; no per-kernel rebuild is
-#     needed (CO-RE relocations adapt it at load time).
-#   - The ONLY reliable persistent copy of the program + scripts is under
-#     /home/.steamos-nsl-sw001-bpf/.  This script re-installs the loader and
-#     the udev rule + program from there on every boot.
+#   - SteamOS replaces /usr (root) and prunes /etc to the atomic-update
+#     keep-list on every A/B update.  /home is never touched.
+#   - The loader binary, its bundled .so deps and the BPF object live under
+#     /home/.steamos-nsl-sw001-bpf/ and stay fresh after every update -- no
+#     pacman, no steamos-readonly unlock, nothing to reinstall.
+#   - This script only re-asserts the /etc copies (udev rule, keep-list,
+#     ensure unit) from the /home seed in case a prune or factory reset
+#     dropped them, and re-attaches the program to a present controller.
 #
 # The unit (steamos-nsl-sw001-bpf.service) is preserved by the atomic-update
-# keep-list, and this script also re-asserts the unit + enablement, so it keeps
-# running across updates.
+# keep-list, so it keeps running across updates.
 
 set -euo pipefail
 
 SEED="/home/.steamos-nsl-sw001-bpf"
+LOADER="sw001-bpf-attach"
 OBJ="nsl-sw001.bpf.o"
 SVC="steamos-nsl-sw001-bpf.service"
 KEEPLIST_CONF="nsl-sw001-bpf.conf"
@@ -27,7 +27,7 @@ RULE="99-hid-bpf-nsl-sw001.rules"
 
 log() { echo "[nsl-sw001-bpf-ensure] $*"; }
 
-if [ ! -f "$SEED/$ENSURE_SH" ]; then
+if [ ! -x "$SEED/$LOADER" ] || [ ! -r "$SEED/$OBJ" ]; then
     log "seed missing at $SEED; nothing to do"
     exit 0
 fi
@@ -41,57 +41,27 @@ run_priv() {
     fi
 }
 
-# --- Bring the rootfs writable (we need to touch /usr and /etc) --------------
-refresh_readonly() {
-    if command -v steamos-readonly >/dev/null 2>&1; then
-        run_priv steamos-readonly disable
-    fi
-}
-
-RO() {
-    if command -v steamos-readonly >/dev/null 2>&1; then
-        run_priv steamos-readonly enable || true
-    fi
-}
-
-refresh_readonly
-trap 'RO' EXIT
-
-# --- 1. Loader ---------------------------------------------------------------
-if ! command -v udev-hid-bpf >/dev/null 2>&1; then
-    log "installing udev-hid-bpf loader"
-    run_priv pacman-key --init >/dev/null 2>&1 || true
-    run_priv pacman-key --populate archlinux >/dev/null 2>&1 || true
-    run_priv pacman-key --populate holo >/dev/null 2>&1 || true
-    run_priv pacman --noconfirm -S --needed udev-hid-bpf || true
-fi
-if ! command -v udev-hid-bpf >/dev/null 2>&1; then
-    log "WARNING: udev-hid-bpf still missing; cannot load the program this boot"
-    log "         (add the Arch extra repo or install it, then run:"
-    log "         sudo udev-hid-bpf install --force $SEED/$OBJ)"
-    exit 0
-fi
-
 if [ ! -r /sys/kernel/btf/vmlinux ]; then
     log "WARNING: /sys/kernel/btf/vmlinux missing; this kernel cannot load HID-BPF programs"
 fi
 
-# --- 2. Re-install the program + udev rule -----------------------------------
-log "re-installing $OBJ via udev-hid-bpf"
-run_priv udev-hid-bpf install --force "$SEED/$OBJ"
-run_priv udevadm control --reload || true
+# --- 1. Re-assert /etc copies from the seed ----------------------------------
+log "re-asserting udev rule"
+run_priv cp "$SEED/$RULE" "/etc/udev/rules.d/$RULE"
 
-# --- 3. Re-assert keep-list + unit + enablement ------------------------------
 if [ ! -f "/etc/atomic-update.conf.d/$KEEPLIST_CONF" ]; then
     log "re-asserting atomic-update keep-list"
     run_priv mkdir -p /etc/atomic-update.conf.d
-    run_priv cp "$SEED/etc/$KEEPLIST_CONF" "/etc/atomic-update.conf.d/$KEEPLIST_CONF"
+    run_priv cp "$SEED/$KEEPLIST_CONF" "/etc/atomic-update.conf.d/$KEEPLIST_CONF"
 fi
-run_priv cp "$SEED/etc/$SVC" "/etc/systemd/system/$SVC"
+
+run_priv cp "$SEED/$SVC" "/etc/systemd/system/$SVC"
 run_priv systemctl daemon-reload
 run_priv systemctl enable "$SVC" >/dev/null 2>&1 || true
 
-# --- 4. Remove any lingering kernel-module route artifacts -------------------
+run_priv udevadm control --reload || true
+
+# --- 2. Remove any lingering kernel-module route artifacts -------------------
 # The module route's global hid-nintendo blacklist would block the BPF route;
 # a fresh A/B update can resurrect it from the module route's own keep-list.
 if [ -f /etc/modprobe.d/blacklist-hid-nintendo.conf ]; then
@@ -103,10 +73,15 @@ if [ -f /etc/modules-load.d/nsl-sw001.conf ]; then
     run_priv rm -f /etc/modules-load.d/nsl-sw001.conf
 fi
 
-# --- 5. Attach to any already-connected controller ---------------------------
+# --- 3. Attach to any already-connected controller ---------------------------
 # The udev rule covers future connects; attach now in case the controller is
 # already paired and powered on.  (If it was connected before the rule existed,
 # power-cycle it once so hid-nintendo binds with the rewritten descriptor.)
-run_priv udev-hid-bpf add - "/etc/udev-hid-bpf/$OBJ" >/dev/null 2>&1 || true
+for d in /sys/bus/hid/devices/0005:057E:2009.*; do
+    [ -d "$d" ] || continue
+    run_priv "$SEED/$LOADER" "$d" "$SEED/$OBJ" >/dev/null 2>&1 \
+        && log "attached to $(basename "$d")" \
+        || log "attach to $(basename "$d") deferred (udev rule handles it)"
+done
 
 log "done"

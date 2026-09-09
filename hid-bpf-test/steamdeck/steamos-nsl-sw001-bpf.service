@@ -1,8 +1,9 @@
 # SteamOS ensure service for the N-SL SW001 HID-BPF program.
 #
-# Runs at boot to re-install the program after a SteamOS A/B update (which
-# replaces /usr and prunes /etc).  Everything is re-seeded from a persistent
-# copy under /home/.steamos-nsl-sw001-bpf/.
+# Runs at boot to re-assert the /etc copies (udev rule, keep-list, unit) from
+# the persistent seed under /home/.steamos-nsl-sw001-bpf/.  The loader, its
+# bundled libs and the BPF object live in /home and survive A/B updates, so
+# there is no pacman and no steamos-readonly unlock.
 #
 # Enabled by the installer (and re-enabled by the ensure script itself, since
 # /etc and /usr may be fresh after an update).

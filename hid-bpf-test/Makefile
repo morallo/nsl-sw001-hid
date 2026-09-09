@@ -19,7 +19,7 @@ ifdef NSL_RUMBLE_ZERO_TOTAL
 BPF_CFLAGS += -DNSL_RUMBLE_ZERO_TOTAL=$(NSL_RUMBLE_ZERO_TOTAL)
 endif
 
-.PHONY: all clean deps inspect install uninstall
+.PHONY: all clean deps inspect install uninstall deck-bundle
 
 all: nsl-sw001.bpf.o
 
@@ -56,5 +56,27 @@ uninstall:
 	sudo rm -f /etc/udev/rules.d/*nsl-sw001* /etc/udev-hid-bpf/*nsl-sw001*
 	@echo "removed installed udev rule + program for nsl-sw001"
 
+# Steam Deck bundle: the self-contained loader + bundled .so deps + the
+# prebuilt object, staged under steamdeck/loader/ for the deck installer
+# (which copies it to /home/.steamos-nsl-sw001-bpf/ -- no pacman, no /usr).
+DECK_LOADER := steamdeck/sw001-bpf-attach.c
+DECK_DIR := steamdeck/loader
+DECK_LIBS := libbpf.so.1 libelf.so.1 libz.so.1 libzstd.so.1
+
+deck-bundle: nsl-sw001.bpf.o
+	mkdir -p $(DECK_DIR)/lib
+	$(CC) $(CFLAGS) -o $(DECK_DIR)/sw001-bpf-attach $(DECK_LOADER) \
+		$(shell pkg-config --cflags libbpf) -Wl,-rpath,'$$ORIGIN/lib' \
+		-lbpf -lelf -lz -lzstd
+	@for lib in $(DECK_LIBS); do \
+		real=$$(ldconfig -p | awk -v l="$$lib" '$$1==l { print $$NF; exit }'); \
+		[ -n "$$real" ] || { echo "MISSING: $$lib (stage sw001-bpf-attach deps)"; exit 1; }; \
+		cp -L "$$real" $(DECK_DIR)/lib/$$lib; \
+		echo "bundled $$lib <- $$real"; \
+	done
+	cp -L nsl-sw001.bpf.o $(DECK_DIR)/
+	@echo "--- deck bundle ready in $(DECK_DIR)/ (copy the whole steamdeck/ tree to the Deck)"
+
 clean:
 	rm -f nsl-sw001.bpf.o vmlinux.h tools/gen_vmlinux_h
+	rm -rf $(DECK_DIR)

@@ -9,31 +9,33 @@
 # so the module route's SDL hacks (SDL_HIDAPI_IGNORE_DEVICES, custom
 # gamecontrollerdb, IMU uaccess rule) are not needed either.
 #
+# Loader: this script does NOT touch /usr.  It uses a self-contained loader
+# (steamdeck/sw001-bpf-attach built with `make deck-bundle`) whose bundled
+# .so deps travel with it, so there is no pacman (no keyring), no
+# steamos-readonly unlock, and nothing to reinstall after an A/B update.
+#
 # What it does (install):
-#   1. Validates we are on SteamOS and requires sudo (or running as root).
-#   2. Installs the udev-hid-bpf loader (pacman, extra repo).
-#   3. Installs nsl-sw001.bpf.o via `udev-hid-bpf install` (udev rule + object
-#      under /etc).
-#   4. Seeds a persistent copy under /home/.steamos-nsl-sw001-bpf/ and installs
-#      the ensure service + atomic-update keep-list so it survives A/B updates.
-#   5. If the old kernel-module route (install-nsl-sw001-deck.sh) is installed,
+#   1. Validates we are on SteamOS-ish Linux and requires sudo (or root).
+#   2. Copies the loader + bundled libs + prebuilt object + scripts under
+#      /home/.steamos-nsl-sw001-bpf/ (the seed; /home persists across updates).
+#   3. Writes the udev rule to /etc, installs the ensure service and adds
+#      both to the atomic-update keep-list (so they survive A/B updates).
+#   4. If the old kernel-module route (install-nsl-sw001-deck.sh) is installed,
 #      removes it: its global hid-nintendo blacklist would otherwise block the
 #      BPF route, and its SDL_HIDAPI_IGNORE_DEVICES would disable the HIDAPI
 #      path the BPF now fixes.
-#   6. Attaches the program to any already-connected SW001 (power-cycle the
+#   5. Attaches the program to any already-connected SW001 (power-cycle the
 #      controller afterwards if it was connected before, so hid-nintendo binds
 #      with the rewritten descriptor).
-#   7. Re-enables the read-only rootfs (unless --keep-writable).
 #
 # Usage:
-#   ./install-nsl-sw001-bpf-deck.sh [--keep-writable] [--uninstall]
+#   ./install-nsl-sw001-bpf-deck.sh [--uninstall]
 #
 # Notes:
-#   - The BPF object must already be built (run `make` in hid-bpf-test/): the
-#     loader prefers a prebuilt object and the Deck has no need for clang.
-#     Looked up next to this script or one directory up.
 #   - Requires the kernel to have CONFIG_DEBUG_INFO_BTF (the Deck kernel does:
 #     /sys/kernel/btf/vmlinux).  The script only warns if it is missing.
+#   - The udev rule references /home/.steamos-nsl-sw001-bpf/ directly and is
+#     re-asserted by the ensure service each boot; /home is never pruned.
 #   - Genuine Pro Controllers matching 057E:2009 are left untouched by the
 #     program itself (hid_rdesc_fixup skips any descriptor that already
 #     declares report 0x21).
@@ -42,18 +44,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEED="/home/.steamos-nsl-sw001-bpf"
+LOADER="sw001-bpf-attach"
 OBJ="nsl-sw001.bpf.o"
 RULE="99-hid-bpf-nsl-sw001.rules"
 SVC="steamos-nsl-sw001-bpf.service"
 KEEPLIST_CONF="nsl-sw001-bpf.conf"
 ENSURE_SH="steamos-nsl-sw001-bpf-ensure.sh"
+LOADER_DIR="$SCRIPT_DIR/loader"
 
-KEEP_WRITABLE=0
 UNINSTALL=0
 for a in "$@"; do
     case "$a" in
-        --keep-writable) KEEP_WRITABLE=1 ;;
-        --uninstall)    UNINSTALL=1 ;;
+        --uninstall) UNINSTALL=1 ;;
         *) echo "unknown arg: $a" >&2; exit 1 ;;
     esac
 done
@@ -71,40 +73,16 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 run_root() { $SUDO "$@"; }
 
-# --- SteamOS checks ----------------------------------------------------------
-if ! command -v steamos-readonly >/dev/null 2>&1; then
-    die "steamos-readonly not found; this installer targets SteamOS"
-fi
-
-# --- Locate the prebuilt BPF object ------------------------------------------
-BPF_SRC=""
-if [ -f "$SCRIPT_DIR/nsl-sw001.bpf.o" ]; then
-    BPF_SRC="$SCRIPT_DIR/nsl-sw001.bpf.o"
-elif [ -f "$SCRIPT_DIR/../nsl-sw001.bpf.o" ]; then
-    BPF_SRC="$SCRIPT_DIR/../nsl-sw001.bpf.o"
-fi
-require_obj() {
-    if [ -z "$BPF_SRC" ]; then
-        die "nsl-sw001.bpf.o not found next to this script; build it first (make in hid-bpf-test/)"
-    fi
-}
-
-# --- Loader ------------------------------------------------------------------
-init_keyring() {
-    # A fresh SteamOS install may not have an initialized pacman keyring.
-    run_root pacman-key --init >/dev/null 2>&1 || true
-    run_root pacman-key --populate archlinux >/dev/null 2>&1 || true
-    run_root pacman-key --populate holo >/dev/null 2>&1 || true
-}
-
-ensure_loader() {
-    if command -v udev-hid-bpf >/dev/null 2>&1; then
-        return
-    fi
-    log "installing udev-hid-bpf loader"
-    init_keyring
-    run_root pacman --noconfirm -S --needed udev-hid-bpf
-    command -v udev-hid-bpf >/dev/null 2>&1 || die "udev-hid-bpf not available; add the Arch extra repo or install it manually"
+# --- Locate the staged bundle (built with `make deck-bundle`) ----------------
+require_bundle() {
+    [ -x "$LOADER_DIR/$LOADER" ] || \
+        die "steamdeck/loader/$LOADER not found; build it first (make deck-bundle in hid-bpf-test/)"
+    [ -f "$LOADER_DIR/$OBJ" ] || \
+        die "steamdeck/loader/$OBJ not found; build it first (make deck-bundle in hid-bpf-test/)"
+    for lib in libbpf.so.1 libelf.so.1 libz.so.1 libzstd.so.1; do
+        [ -f "$LOADER_DIR/lib/$lib" ] || \
+            die "steamdeck/loader/lib/$lib not found; re-run make deck-bundle"
+    done
 }
 
 # --- Old kernel-module route (install-nsl-sw001-deck.sh), if present ---------
@@ -140,7 +118,6 @@ purge_module_route() {
     run_root sed -i '/# N-SL SW001 (added by install-nsl-sw001-deck.sh/,/^# end nsl-sw001/d' \
         /etc/environment 2>/dev/null || true
     run_root rm -rf "$MODULE_SEED"
-    # per-user environment.d copy
     local USERDIR=""
     if [ -n "${SUDO_USER:-}" ]; then
         USERDIR="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
@@ -152,20 +129,30 @@ purge_module_route() {
     fi
 }
 
+# --- Attach to any currently-connected SW001 ---------------------------------
+# Deferred attaches are fine: the udev rule picks them up on the next connect.
+attach_devices() {
+    for d in /sys/bus/hid/devices/0005:057E:2009.*; do
+        [ -d "$d" ] || continue
+        if run_root "$SEED/$LOADER" "$d" "$SEED/$OBJ" >/dev/null 2>&1; then
+            log "attached to $(basename "$d")"
+        else
+            log "attach to $(basename "$d") deferred (udev rule will load it on connect)"
+        fi
+    done
+}
+
 # --- Uninstall ---------------------------------------------------------------
 uninstall() {
     log "uninstalling"
     run_root rm -f "/etc/udev/rules.d/$RULE"
-    run_root rm -f "/etc/udev-hid-bpf/$OBJ"
     run_root rm -f "/etc/atomic-update.conf.d/$KEEPLIST_CONF"
     run_root rm -f "/etc/systemd/system/$SVC"
     run_root systemctl disable "$SVC" >/dev/null 2>&1 || true
     run_root systemctl daemon-reload
     run_root udevadm control --reload >/dev/null 2>&1 || true
+    run_root rm -f /sys/fs/bpf/hid/*/nsl-sw001_bpf 2>/dev/null || true
     rm -rf "$SEED"
-    if [ "$KEEP_WRITABLE" -eq 0 ]; then
-        run_root steamos-readonly enable >/dev/null 2>&1 || true
-    fi
     log "uninstalled"
     exit 0
 }
@@ -174,65 +161,52 @@ if [ "$UNINSTALL" -eq 1 ]; then
     uninstall
 fi
 
-require_obj
-log "SteamOS installer for the SW001 HID-BPF program ($(basename "$BPF_SRC"))"
-log "BPF object: $BPF_SRC"
+require_bundle
+log "SteamOS installer for the SW001 HID-BPF program ($OBJ)"
+log "bundle: $LOADER_DIR"
 
-# --- 0. Read-only off (temporary) -------------------------------------------
-run_root steamos-readonly disable
-
-# --- 1. Loader ---------------------------------------------------------------
-ensure_loader
 if [ ! -r /sys/kernel/btf/vmlinux ]; then
     log "WARNING: /sys/kernel/btf/vmlinux missing; the Deck kernel must have"
     log "         CONFIG_DEBUG_INFO_BTF for HID-BPF to load"
 fi
 
-# --- 2. Install the BPF program via udev-hid-bpf -----------------------------
-log "installing $OBJ via udev-hid-bpf"
-run_root udev-hid-bpf install --force "$BPF_SRC"
-test -f "/etc/udev/rules.d/$RULE" || {
-    run_root udev-hid-bpf inspect "$BPF_SRC" || true
-    die "$RULE was not generated; inspect output above"
-}
-run_root udevadm control --reload || true
-
-# --- 3. Persistent seed + ensure service (survives A/B updates) --------------
-log "seeding persistent copy under $SEED"
+# --- 1. Seed under /home (persists across A/B updates, never pruned) ---------
+log "seeding $SEED (loader + bundled libs + object + scripts)"
 run_root rm -rf "$SEED"
-run_root mkdir -p "$SEED/src" "$SEED/etc"
-run_root cp "$BPF_SRC" "$SEED/src/$OBJ"
-run_root cp "$SCRIPT_DIR/$KEEPLIST_CONF" "$SEED/etc/"
-run_root cp "$SCRIPT_DIR/$SVC" "$SEED/etc/"
+run_root mkdir -p "$SEED/lib"
+run_root cp "$LOADER_DIR/$LOADER" "$SEED/$LOADER"
+run_root cp "$LOADER_DIR"/lib/*.so.1 "$SEED/lib/"
+run_root cp "$LOADER_DIR/$OBJ" "$SEED/$OBJ"
 run_root cp "$SCRIPT_DIR/$ENSURE_SH" "$SEED/$ENSURE_SH"
-run_root chmod +x "$SEED/$ENSURE_SH"
+run_root cp "$SCRIPT_DIR/$SVC" "$SEED/$SVC"
+run_root cp "$SCRIPT_DIR/$KEEPLIST_CONF" "$SEED/$KEEPLIST_CONF"
+run_root cp "$SCRIPT_DIR/$RULE" "$SEED/$RULE"
+run_root chmod +x "$SEED/$LOADER" "$SEED/$ENSURE_SH" 2>/dev/null || true
 run_root chown -R root:root "$SEED"
 
-log "installing ensure service"
-run_root cp "$SEED/etc/$SVC" "/etc/systemd/system/$SVC"
-run_root systemctl daemon-reload
-run_root systemctl enable "$SVC" >/dev/null
+# --- 2. /etc: udev rule + keep-list + ensure unit ----------------------------
+log "installing udev rule"
+run_root cp "$SEED/$RULE" "/etc/udev/rules.d/$RULE"
+run_root udevadm control --reload || true
 
 log "installing atomic-update keep-list"
 run_root mkdir -p /etc/atomic-update.conf.d
-run_root cp "$SEED/etc/$KEEPLIST_CONF" "/etc/atomic-update.conf.d/$KEEPLIST_CONF"
+run_root cp "$SEED/$KEEPLIST_CONF" "/etc/atomic-update.conf.d/$KEEPLIST_CONF"
 
-# --- 4. Drop the old kernel-module route -------------------------------------
+log "installing ensure service"
+run_root cp "$SEED/$SVC" "/etc/systemd/system/$SVC"
+run_root systemctl daemon-reload
+run_root systemctl enable "$SVC" >/dev/null
+
+# --- 3. Drop the old kernel-module route -------------------------------------
 purge_module_route
 
-# --- 5. Attach to an already-connected controller, restore readonly ----------
-log "attaching to any present SW001 (power-cycle it if it was already connected)"
-run_root udev-hid-bpf add - "/etc/udev-hid-bpf/$OBJ" >/dev/null 2>&1 || \
-    log "(no controller present right now; the udev rule will load it on connect)"
-
-if [ "$KEEP_WRITABLE" -eq 0 ]; then
-    log "re-enabling read-only rootfs"
-    run_root steamos-readonly enable
-else
-    log "leaving rootfs writable (--keep-writable)"
-fi
+# --- 4. Attach to an already-connected controller ----------------------------
+attach_devices
 
 echo
 log "done."
 log "Verify:  journalctl -k -f   (unplug/replug -> 'input: Pro Controller ... IMU', no -110)"
 log "         bpftool prog | grep sw001"
+log "Note: if the controller was connected during install, power-cycle it once"
+log "      so hid-nintendo binds with the rewritten descriptor."
