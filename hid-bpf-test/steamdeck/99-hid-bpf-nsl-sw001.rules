@@ -2,8 +2,8 @@
 #
 # No /usr writes, no pacman, no steamos-readonly unlock.  The loader binary,
 # its bundled libs and the BPF object live in /home/.steamos-nsl-sw001-bpf/
-# (never touched by A/B updates); this rule is re-asserted from the seed by
-# the ensure service if it is ever pruned.
+# (never touched by A/B updates); this rule is on the atomic-update keep-list,
+# so it survives A/B updates too.
 ACTION!="add", GOTO="nsl_sw001_end"
 SUBSYSTEM!="hid", GOTO="nsl_sw001_end"
 ENV{MODALIAS}!="hid:b0005g*v0000057Ep00002009", GOTO="nsl_sw001_end"

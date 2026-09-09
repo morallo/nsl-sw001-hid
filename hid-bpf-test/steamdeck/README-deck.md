@@ -20,8 +20,9 @@ with a **small self-contained loader** (`sw001-bpf-attach`) instead of the
   SteamOS never prunes. After any update everything is still there.
 - **No pacman** (no keyring setup, no repo issues) — the loader is a ~20 kB
   binary built once on the dev machine (`make deck-bundle`).
-- The only `/etc` additions (udev rule + ensure unit) are on the
-  atomic-update keep-list, and the ensure service re-asserts them every boot.
+- The only `/etc` addition is the udev rule, and it is on the atomic-update
+  keep-list. All live work (attach on connect) happens in udev, so there is
+  **no boot service to keep running**.
 
 ## What it gives you over the kernel-module route
 
@@ -45,9 +46,7 @@ rewrites the report descriptor and fakes the SPI calibration reads.
 | `loader/` | staged bundle: loader binary + bundled `.so`s + `nsl-sw001.bpf.o` (`make deck-bundle`) |
 | `99-hid-bpf-nsl-sw001.rules` | udev rule pointing at the `/home` loader |
 | `install-nsl-sw001-bpf-deck.sh` | installer (pass `--uninstall` to remove) |
-| `steamos-nsl-sw001-bpf-ensure.sh` | boot-time re-assert script (re-copies `/etc` artifacts, re-attaches) |
-| `steamos-nsl-sw001-bpf.service` | systemd unit that runs the ensure script at boot |
-| `atomic-update-additional-keep-list.conf` | keeps the `/etc` udev rule + unit across A/B updates |
+| `nsl-sw001-bpf.conf` | keeps the `/etc` udev rule across A/B updates |
 | `README-deck.md` | this file |
 
 ## How the loader works
@@ -78,11 +77,19 @@ make deck-bundle   # in hid-bpf-test/: builds loader/ + bundles .so deps
 
 Options:
 
-- `--uninstall` — remove seed, udev rule, ensure service and keep-list entry.
+- `--uninstall` — remove seed, udev rule and keep-list entry.
 
-If the old kernel-module route (`install-nsl-sw001-deck.sh`) is detected, it is
-removed automatically: its global `hid_nintendo` blacklist and
-`SDL_HIDAPI_IGNORE_DEVICES` would otherwise defeat the BPF route.
+If the old kernel-module route (`install-nsl-sw001-deck.sh`) is detected, the
+installer **fully uninstalls it**: DKMS entry + source, the `/etc` artifacts
+(blacklist, modules-load, IMU uaccess rule, its atomic-update keep-list), the
+ensure unit, the `/home/.steamos-nsl-sw001` seed and the SDL env vars. A clean
+Deck that never had the module route installs standalone and needs nothing
+extra — the "uninstall" only fires when residue is found.
+
+The one thing a full uninstall cannot remove without a `steamos-readonly`
+unlock is the compiled `.ko` for the current kernel under the read-only
+`/usr/lib/modules`. It is inert (modprobe blacklist support gone, no
+auto-load entry, module unloaded) and disappears at the next A/B update.
 
 After install, fully restart Steam, and **power-cycle the controller once** if
 it was connected during install (the report-descriptor rewrite only applies at
@@ -105,17 +112,22 @@ HIDAPI over hidraw).
 
 ## How persistence across A/B updates works
 
-- `/home/.steamos-nsl-sw001-bpf/` holds the loader, bundled libs, object and a
-  copy of every script; `/home` is never pruned.
-- `/etc/udev/rules.d/99-hid-bpf-nsl-sw001.rules` and the ensure unit are on
-  the atomic-update keep-list, so early-boot connects load the program
-  immediately.
-- Every boot, `steamos-nsl-sw001-bpf-ensure.service` re-asserts the `/etc`
-  copies (one-time cost, pure `/etc` overlay writes — no unlock) and attaches
-  to an already-connected controller.
-- Companion note: the ensure script also removes a lingering module-route
-  blacklist, which an update could resurrect from the module route's own
-  keep-list.
+There is no boot service. The two things that must survive an update are both
+covered by the same mechanism:
+
+- `/home/.steamos-nsl-sw001-bpf/` holds the loader, bundled libs, object, the
+  udev rule and the keep-list; `/home` is never pruned.
+- `/etc/udev/rules.d/99-hid-bpf-nsl-sw001.rules` is on the atomic-update
+  keep-list (via `/etc/atomic-update.conf.d/nsl-sw001-bpf.conf`), so it stays
+  in place across A/B updates and fires on every controller connect.
+
+The only event that mattered at boot was "controller already connected when
+the system comes up" — and that is not a case that needs handling here: a
+Bluetooth HID device gets a fresh `add` event on every reconnect, which is
+the udev rule's trigger. The SW001 is Bluetooth-only in practice, so a
+`power-cycle` of the controller is always enough to (re)attach. If an attach
+ever fails transiently (e.g. an unusually early connect), the next connect
+retries it; a `sudo udevadm trigger` also re-runs it.
 
 ## Requirements / caveats
 
