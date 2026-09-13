@@ -290,6 +290,10 @@ struct nsl_sw001_data {
     u16 rumble_rh_freq;
     unsigned short rumble_zero_countdown;
     bool rumble_active;
+    /* Set once in remove(); raw_event and the rumble worker check it so
+     * nothing touches the input devices / output path after teardown
+     * starts.  Guarded by ->lock. */
+    bool stopping;
     /* Rumble output is sent from a workqueue, never from raw_event: the BT
      * HIDP output path can block on the L2CAP socket lock, so sending
      * synchronously from the input-report context deadlocks. */
@@ -572,6 +576,22 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
     struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
 
     /*
+     * remove() can run concurrently with this callback (input is delivered
+     * on BlueZ's thread while the uhid remove worker tears the device
+     * down), so once teardown starts we stop touching drvdata entirely.
+     */
+    if (drvdata) {
+        unsigned long flags;
+        bool stopping;
+
+        spin_lock_irqsave(&drvdata->lock, flags);
+        stopping = drvdata->stopping;
+        spin_unlock_irqrestore(&drvdata->lock, flags);
+        if (stopping)
+            return 0;
+    }
+
+    /*
      * Subcmd reply (0x21): wake any synchronous waiter that sent a
      * subcommand and is blocked in wait_event_timeout(). Copy the whole
      * reply into input_buf for the caller to parse.  Return 0 so the
@@ -616,10 +636,26 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
     }
 
     /* Newest IMU sample: 6x int16 LE at data[37..48] (full 49-byte report). */
-    if (drvdata && drvdata->imu_dev && size >= 49) {
+    if (drvdata && size >= 49) {
+        struct input_dev *imu_dev;
+        unsigned long flags;
         s16 raw_accel[3], raw_gyro[3];
         s32 accel[3], gyro[3];
         int i;
+
+        /*
+         * Grab a reference so remove()'s input_unregister_device() on the
+         * removal thread cannot free the device while we report into it
+         * (drvdata->imu_dev is NULLed there with no other protection).
+         */
+        spin_lock_irqsave(&drvdata->lock, flags);
+        imu_dev = drvdata->imu_dev;
+        if (imu_dev)
+            input_get_device(imu_dev);
+        spin_unlock_irqrestore(&drvdata->lock, flags);
+
+        if (!imu_dev)
+            return 0;
 
         /*
          * Extract raw 16-bit samples, then apply the controller's factory
@@ -642,17 +678,18 @@ static int nsl_sw001_raw_event(struct hid_device *hdev,
                        drvdata->accel_divisor[i];
         }
 
-        input_report_abs(drvdata->imu_dev, ABS_X, accel[0]);
-        input_report_abs(drvdata->imu_dev, ABS_Y, accel[1]);
-        input_report_abs(drvdata->imu_dev, ABS_Z, accel[2]);
-        input_report_abs(drvdata->imu_dev, ABS_RX, gyro[0]);
-        input_report_abs(drvdata->imu_dev, ABS_RY, gyro[1]);
-        input_report_abs(drvdata->imu_dev, ABS_RZ, gyro[2]);
+        input_report_abs(imu_dev, ABS_X, accel[0]);
+        input_report_abs(imu_dev, ABS_Y, accel[1]);
+        input_report_abs(imu_dev, ABS_Z, accel[2]);
+        input_report_abs(imu_dev, ABS_RX, gyro[0]);
+        input_report_abs(imu_dev, ABS_RY, gyro[1]);
+        input_report_abs(imu_dev, ABS_RZ, gyro[2]);
 
         drvdata->imu_timestamp_us += 8000; /* ~8 ms per BT report */
-        input_event(drvdata->imu_dev, EV_MSC, MSC_TIMESTAMP,
+        input_event(imu_dev, EV_MSC, MSC_TIMESTAMP,
                     drvdata->imu_timestamp_us);
-        input_sync(drvdata->imu_dev);
+        input_sync(imu_dev);
+        input_put_device(imu_dev);
     }
 
     /*
@@ -850,8 +887,17 @@ static void nsl_rumble_worker(struct work_struct *work);
 
 static void nsl_queue_rumble(struct nsl_sw001_data *drvdata)
 {
-    if (drvdata->rumble_wq)
+    unsigned long flags;
+
+    /*
+     * Guard the queue pointer with ->lock: remove() NULLs it under the
+     * same lock (and destroy_workqueue() then returns before raw_event can
+     * enqueue), so queue_work() can never race a destroyed queue.
+     */
+    spin_lock_irqsave(&drvdata->lock, flags);
+    if (drvdata->rumble_wq && !drvdata->stopping)
         queue_work(drvdata->rumble_wq, &drvdata->rumble_work);
+    spin_unlock_irqrestore(&drvdata->lock, flags);
 }
 
 static void nsl_rumble_worker(struct work_struct *work)
@@ -867,12 +913,17 @@ static void nsl_rumble_worker(struct work_struct *work)
         drvdata->subcmd_num = 0;
 
     spin_lock_irqsave(&drvdata->lock, flags);
+    if (drvdata->stopping) {
+        spin_unlock_irqrestore(&drvdata->lock, flags);
+        return;
+    }
     memcpy(rpt.rumble_data, drvdata->rumble_data, NSL_RUMBLE_DATA_SIZE);
     spin_unlock_irqrestore(&drvdata->lock, flags);
 
     nsl_enforce_output_rate(drvdata);
     mutex_lock(&drvdata->output_mutex);
-    hid_hw_output_report(drvdata->hdev, (u8 *)&rpt, sizeof(rpt));
+    if (!drvdata->stopping)
+        hid_hw_output_report(drvdata->hdev, (u8 *)&rpt, sizeof(rpt));
     mutex_unlock(&drvdata->output_mutex);
 }
 
@@ -1198,7 +1249,8 @@ static int nsl_sw001_probe(struct hid_device *hdev,
     drvdata->rumble_rl_freq = NSL_RUMBLE_DFLT_LOW_HZ;
     drvdata->rumble_rh_freq = NSL_RUMBLE_DFLT_HIGH_HZ;
     drvdata->rumble_msecs = jiffies_to_msecs(jiffies);
-    drvdata->rumble_wq = alloc_workqueue("hid-nsl-sw001-rumble", 0, 0);
+    drvdata->rumble_wq = alloc_workqueue("hid-nsl-sw001-rumble",
+                                         WQ_UNBOUND, 0);
     if (!drvdata->rumble_wq) {
         hid_err(hdev, "failed to allocate rumble workqueue\n");
         return -ENOMEM;
@@ -1312,6 +1364,9 @@ static int nsl_sw001_probe(struct hid_device *hdev,
 static void nsl_sw001_remove(struct hid_device *hdev)
 {
     struct nsl_sw001_data *drvdata = hid_get_drvdata(hdev);
+    struct input_dev *imu_dev;
+    unsigned long flags;
+    struct workqueue_struct *wq;
 
     if (drvdata) {
         /* Wake any blocked synchronous waiter before tearing down */
@@ -1319,22 +1374,42 @@ static void nsl_sw001_remove(struct hid_device *hdev)
         wake_up(&drvdata->wait);
 
         /*
+         * Stop rumble before touching the device: raw_event and the worker
+         * can run concurrently (uhid delivers input on BlueZ's thread while
+         * the remove worker tears the device down).  Blank the queue pointer
+         * under ->lock so nsl_queue_rumble() cannot enqueue, cancel any
+         * in-flight worker, then destroy — all before hid_hw_close/stop so a
+         * running worker never sends output on a closing device.
+         */
+        spin_lock_irqsave(&drvdata->lock, flags);
+        wq = drvdata->rumble_wq;
+        drvdata->rumble_wq = NULL;
+        drvdata->stopping = true;
+        spin_unlock_irqrestore(&drvdata->lock, flags);
+        if (wq) {
+            cancel_work_sync(&drvdata->rumble_work);
+            destroy_workqueue(wq);
+        }
+
+        /*
          * The IMU device is registered separately from hid-input; hid core
          * only tears down the gamepad nodes, so unregister it here or it
          * lingers as a zombie evdev node whose uniq/phys point into the
-         * freed hid_device (UAF if userspace still holds it open).
+         * freed hid_device (UAF if userspace still holds it open).  The
+         * NULL write is done under ->lock (raw_event reads the pointer and
+         * takes a ref under the same lock); the unregister itself runs
+         * unlocked because raw_event's input_get_device() keeps the struct
+         * alive while a report is in flight.
          */
-        if (drvdata->imu_dev) {
-            input_unregister_device(drvdata->imu_dev);
-            drvdata->imu_dev = NULL;
-        }
+        spin_lock_irqsave(&drvdata->lock, flags);
+        imu_dev = drvdata->imu_dev;
+        drvdata->imu_dev = NULL;
+        spin_unlock_irqrestore(&drvdata->lock, flags);
+        if (imu_dev)
+            input_unregister_device(imu_dev);
     }
     hid_hw_close(hdev);
     hid_hw_stop(hdev);
-    /* No more raw_events after hid_hw_stop, so it is safe to flush queued
-     * rumble sends (they now fail harmlessly on the stopped device). */
-    if (drvdata && drvdata->rumble_wq)
-        destroy_workqueue(drvdata->rumble_wq);
 }
 
 static const struct hid_device_id nsl_sw001_devices[] = {
