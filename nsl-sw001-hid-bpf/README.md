@@ -1,8 +1,7 @@
 # nsl-sw001-hid-bpf: SW001 → hid-nintendo via a HID-BPF filter
 
-Experiment: replace the custom `hid-nsl-sw001` kernel module with a **HID-BPF**
-filter that makes the in-tree **`hid-nintendo`** driver bind and work on the
-N-SL SW001 clone — no module, no `hid-nintendo` blacklist.
+**HID-BPF** filter that makes the in-tree **`hid-nintendo`** driver bind and 
+work on the N-SL SW001 clone — no module, no `hid-nintendo` blacklist.
 
 ## Why this can work (verified against kernel 7.2.3 / torvalds master)
 
