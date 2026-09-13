@@ -23,14 +23,7 @@
 #   3. Writes the udev rule to /etc and adds it to the atomic-update keep-list
 #      (so it survives A/B updates).  The rule triggers the loader on every
 #      controller connect -- there is no boot service to maintain.
-#   4. If the old kernel-module route (install-nsl-sw001-deck.sh) is installed,
-#      fully uninstalls it: DKMS entry + source, /etc artifacts (modprobe
-#      blacklist, modules-load, IMU uaccess rule, keep-list), the ensure unit,
-#      the /home seed and the SDL env vars.  Its global hid-nintendo blacklist
-#      would otherwise block the BPF route, and SDL_HIDAPI_IGNORE_DEVICES
-#      would disable the HIDAPI path the BPF now fixes.  A clean Deck that
-#      never had the module route installs standalone and skips this step.
-#   5. Attaches the program to any already-connected SW001 (power-cycle the
+#   4. Attaches the program to any already-connected SW001 (power-cycle the
 #      controller afterwards if it was connected before, so hid-nintendo binds
 #      with the rewritten descriptor).
 #
@@ -83,62 +76,6 @@ require_bundle() {
         die "steamdeck/loader/$LOADER not found; build it first (make deck-bundle in hid-bpf-test/)"
     [ -f "$LOADER_DIR/$OBJ" ] || \
         die "steamdeck/loader/$OBJ not found; build it first (make deck-bundle in hid-bpf-test/)"
-}
-
-# --- Old kernel-module route (install-nsl-sw001-deck.sh), if present ---------
-# Its global hid-nintendo blacklist and SDL_HIDAPI_IGNORE_DEVICES break the
-# BPF route, so fully uninstall it.  Scope note: removing the compiled .ko
-# under /usr/lib/modules needs a steamos-readonly unlock; we do NOT do that
-# (the loader route's whole point).  Without it the .ko may stay until the
-# next A/B update replaces /usr, but it can never auto-load again
-# (modules-load.d is gone) and nothing resurrects it (blacklist, ensure unit
-# and the module route's own keep-list are removed here).
-MODULE_UNIT="steamos-nsl-ensure.service"
-MODULE_SEED="/home/.steamos-nsl-sw001"
-MODULE_DKMS="nsl-sw001-hid/1.0"
-MODULE_SRC="/usr/src/nsl-sw001-hid-1.0"
-
-purge_module_route() {
-    local found=0
-    [ -f /etc/modprobe.d/blacklist-hid-nintendo.conf ] && found=1
-    [ -f /etc/modules-load.d/nsl-sw001.conf ] && found=1
-    [ -f /etc/udev/rules.d/99-nsl-sw001-imu.rules ] && found=1
-    [ -f /etc/atomic-update.conf.d/nsl-sw001.conf ] && found=1
-    [ -f "/etc/systemd/system/$MODULE_UNIT" ] && found=1
-    [ -d "$MODULE_SEED" ] && found=1
-    find /lib/modules -name 'hid-nsl-sw001.ko*' -print -quit 2>/dev/null | grep -q . && found=1
-    [ "$found" -eq 0 ] && return
-
-    log "fully uninstalling the old kernel-module route"
-    run_root systemctl disable "$MODULE_UNIT" >/dev/null 2>&1 || true
-    run_root rm -f "/etc/systemd/system/$MODULE_UNIT"
-    run_root rm -f /etc/modprobe.d/blacklist-hid-nintendo.conf
-    run_root rm -f /etc/modules-load.d/nsl-sw001.conf
-    run_root rm -f /etc/udev/rules.d/99-nsl-sw001-imu.rules
-    run_root rm -f /etc/atomic-update.conf.d/nsl-sw001.conf
-    if command -v dkms >/dev/null 2>&1; then
-        run_root dkms remove "$MODULE_DKMS" --all >/dev/null 2>&1 || true
-    fi
-    run_root rm -rf "$MODULE_SRC"
-    run_root rmmod hid-nsl-sw001 >/dev/null 2>&1 || true
-    # Best effort: read-only /usr/lib/modules may reject this until the next
-    # A/B update; without the decayed /etc glue the module is inert anyway.
-    run_root sh -c 'find /lib/modules -name "hid-nsl-sw001.ko*" -delete' 2>/dev/null || true
-    run_root depmod -a >/dev/null 2>&1 || true
-    run_root sed -i '/# N-SL SW001 (added by install-nsl-sw001-deck.sh/,/^# end nsl-sw001/d' \
-        /etc/environment 2>/dev/null || true
-    run_root rm -rf "$MODULE_SEED"
-    local USERDIR=""
-    if [ -n "${SUDO_USER:-}" ]; then
-        USERDIR="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    else
-        USERDIR="$HOME"
-    fi
-    if [ -n "$USERDIR" ] && [ -f "$USERDIR/.config/environment.d/nsl-sw001.conf" ]; then
-        rm -f "$USERDIR/.config/environment.d/nsl-sw001.conf"
-    fi
-    run_root systemctl daemon-reload 2>/dev/null || true
-    run_root udevadm control --reload >/dev/null 2>&1 || true
 }
 
 # --- Attach to any currently-connected SW001 ---------------------------------
@@ -199,10 +136,7 @@ log "installing atomic-update keep-list"
 run_root mkdir -p /etc/atomic-update.conf.d
 run_root cp "$SEED/$KEEPLIST_CONF" "/etc/atomic-update.conf.d/$KEEPLIST_CONF"
 
-# --- 3. Drop the old kernel-module route -------------------------------------
-purge_module_route
-
-# --- 4. Attach to an already-connected controller ----------------------------
+# --- 3. Attach to an already-connected controller ----------------------------
 attach_devices
 
 echo
