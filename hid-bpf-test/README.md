@@ -122,11 +122,11 @@ make uninstall        # removes /etc/udev/rules.d/*nsl-sw001* and /etc/udev-hid-
 ## Steam Deck (SteamOS) deployment
 
 `steamdeck/` packages the prebuilt object for the Deck with a **self-contained
-loader** (`sw001-bpf-attach`, built off-Deck by `make deck-bundle`) instead of
-the `udev-hid-bpf` pacman package: no pacman, no `steamos-readonly` unlock, and
-no reinstall after A/B updates (loader + bundled `.so`s + object live under
-`/home`, which SteamOS never prunes).  The installer writes the udev rule to
-`/etc` and adds it to the atomic-update keep-list, seeds
+statically-linked loader** (`sw001-bpf-attach`, built off-Deck by
+`make deck-bundle`) instead of the `udev-hid-bpf` pacman package: no pacman, no
+`steamos-readonly` unlock, and no reinstall after A/B updates (loader + object
+live under `/home`, which SteamOS never prunes).  The installer writes the udev
+rule to `/etc` and adds it to the atomic-update keep-list, seeds
 `/home/.steamos-nsl-sw001-bpf/`, and removes the old kernel-module route if
 present (its `hid_nintendo` blacklist and `SDL_HIDAPI_IGNORE_DEVICES` would
 defeat the BPF route).  There is no boot service — the udev rule attaches on

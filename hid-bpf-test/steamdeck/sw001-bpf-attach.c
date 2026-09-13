@@ -14,9 +14,13 @@
  *   3. calls bpf_map__attach_struct_ops() and pins the link under
  *      /sys/fs/bpf/hid/ so it stays attached after this process exits.
  *
- * Build (dev machine only, Deck gets the prebuilt binary):
- *   gcc -O2 sw001-bpf-attach.c $(pkg-config --cflags libbpf) \
- *       -Wl,-rpath,'$ORIGIN/lib' -o sw001-bpf-attach -lbpf -lelf -lz -lzstd
+ * Build (dev machine only, Deck gets the prebuilt binary): the loader is
+ * STATICALLY linked against libbpf/libelf/libz/libzstd so it carries no
+ * shared-library ABI the Deck could mismatch (see Makefile deck-bundle):
+ *   sudo dnf install -y glibc-static libbpf-static libzstd-static \
+ *                       zlib-ng-compat-static
+ *   make deck-bundle      # builds .build/elfutils libelf+libeu from source,
+ *                         # then gcc -static sw001-bpf-attach.c -lbpf -lz ...
  */
 
 #include <errno.h>

@@ -9,16 +9,17 @@
 # so the module route's SDL hacks (SDL_HIDAPI_IGNORE_DEVICES, custom
 # gamecontrollerdb, IMU uaccess rule) are not needed either.
 #
-# Loader: this script does NOT touch /usr.  It uses a self-contained loader
-# (steamdeck/sw001-bpf-attach built with `make deck-bundle`) whose bundled
-# .so deps travel with it, so there is no pacman (no keyring), no
-# steamos-readonly unlock, and nothing to reinstall after an A/B update.
+# Loader: this script does NOT touch /usr.  It uses a self-contained STATICALLY
+# LINKED loader (steamdeck/sw001-bpf-attach built with `make deck-bundle`) that
+# carries libbpf/libelf/libz/libzstd inside the binary, so there is no pacman
+# (no keyring), no steamos-readonly unlock, no bundled .so ABI to mismatch,
+# and nothing to reinstall after an A/B update.
 #
 # What it does (install):
 #   1. Validates we are on SteamOS-ish Linux and requires sudo (or root).
-#   2. Copies the loader + bundled libs + prebuilt object + scripts (udev rule,
-#      atomic-update keep-list) under /home/.steamos-nsl-sw001-bpf/ (the seed;
-#      /home persists across updates).
+#   2. Copies the loader + prebuilt object + scripts (udev rule, atomic-update
+#      keep-list) under /home/.steamos-nsl-sw001-bpf/ (the seed; /home
+#      persists across updates).
 #   3. Writes the udev rule to /etc and adds it to the atomic-update keep-list
 #      (so it survives A/B updates).  The rule triggers the loader on every
 #      controller connect -- there is no boot service to maintain.
@@ -82,10 +83,6 @@ require_bundle() {
         die "steamdeck/loader/$LOADER not found; build it first (make deck-bundle in hid-bpf-test/)"
     [ -f "$LOADER_DIR/$OBJ" ] || \
         die "steamdeck/loader/$OBJ not found; build it first (make deck-bundle in hid-bpf-test/)"
-    for lib in libbpf.so.1 libelf.so.1 libz.so.1 libzstd.so.1; do
-        [ -f "$LOADER_DIR/lib/$lib" ] || \
-            die "steamdeck/loader/lib/$lib not found; re-run make deck-bundle"
-    done
 }
 
 # --- Old kernel-module route (install-nsl-sw001-deck.sh), if present ---------
@@ -183,11 +180,10 @@ if [ ! -r /sys/kernel/btf/vmlinux ]; then
 fi
 
 # --- 1. Seed under /home (persists across A/B updates, never pruned) ---------
-log "seeding $SEED (loader + bundled libs + object + rule + keep-list)"
+log "seeding $SEED (loader + object + rule + keep-list)"
 run_root rm -rf "$SEED"
-run_root mkdir -p "$SEED/lib"
+run_root mkdir -p "$SEED"
 run_root cp "$LOADER_DIR/$LOADER" "$SEED/$LOADER"
-run_root cp "$LOADER_DIR"/lib/*.so.1 "$SEED/lib/"
 run_root cp "$LOADER_DIR/$OBJ" "$SEED/$OBJ"
 run_root cp "$SCRIPT_DIR/$KEEPLIST_CONF" "$SEED/$KEEPLIST_CONF"
 run_root cp "$SCRIPT_DIR/$RULE" "$SEED/$RULE"

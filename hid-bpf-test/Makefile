@@ -56,27 +56,55 @@ uninstall:
 	sudo rm -f /etc/udev/rules.d/*nsl-sw001* /etc/udev-hid-bpf/*nsl-sw001*
 	@echo "removed installed udev rule + program for nsl-sw001"
 
-# Steam Deck bundle: the self-contained loader + bundled .so deps + the
-# prebuilt object, staged under steamdeck/loader/ for the deck installer
-# (which copies it to /home/.steamos-nsl-sw001-bpf/ -- no pacman, no /usr).
+# Steam Deck bundle: a single statically-linked loader + the prebuilt object,
+# staged under steamdeck/loader/ for the deck installer.
+#
+# The loader links libbpf + libelf statically, so the Deck needs NOTHING from
+# its userspace: no bundled .so, no RPATH, no glibc symbol-version sensitivity
+# (this is what frees it from ABI drift between the build machine and SteamOS).
+#
+# Dev-machine build requirements (once):
+#   sudo dnf install -y glibc-static libbpf-static libzstd-static zlib-ng-compat-static
+# libelf/libeu have no Fedora static package, so they are built once from
+# elfutils source into .build/ (cached; needs network only when missing).
 DECK_LOADER := steamdeck/sw001-bpf-attach.c
 DECK_DIR := steamdeck/loader
-DECK_LIBS := libbpf.so.1 libelf.so.1 libz.so.1 libzstd.so.1
+DECK_BUILD := .build
+DECK_ELF := $(DECK_BUILD)/elfutils
+DECK_ELF_TAR := $(DECK_BUILD)/elfutils-0.193.tar.bz2
+DECK_ELF_LIBS := $(DECK_ELF)/libelf/libelf.a $(DECK_ELF)/lib/libeu.a
 
-deck-bundle: nsl-sw001.bpf.o
-	mkdir -p $(DECK_DIR)/lib
-	$(CC) $(CFLAGS) -o $(DECK_DIR)/sw001-bpf-attach $(DECK_LOADER) \
-		$(shell pkg-config --cflags libbpf) -Wl,-rpath,'$$ORIGIN/lib' \
-		-lbpf -lelf -lz -lzstd
-	@for lib in $(DECK_LIBS); do \
-		real=$$(ldconfig -p | awk -v l="$$lib" '$$1==l { print $$NF; exit }'); \
-		[ -n "$$real" ] || { echo "MISSING: $$lib (stage sw001-bpf-attach deps)"; exit 1; }; \
-		cp -L "$$real" $(DECK_DIR)/lib/$$lib; \
-		echo "bundled $$lib <- $$real"; \
-	done
+$(DECK_BUILD):
+	mkdir -p $@
+
+$(DECK_ELF_LIBS): | $(DECK_BUILD)
+	@test -f "$(DECK_ELF_TAR)" || curl -sL --max-time 300 \
+		-o "$(DECK_ELF_TAR)" https://sourceware.org/elfutils/ftp/0.193/elfutils-0.193.tar.bz2
+	rm -rf $(DECK_ELF)
+	tar xjf "$(DECK_ELF_TAR)" -C $(DECK_BUILD)
+	cd $(DECK_BUILD)/elfutils-0.193 && \
+		./configure --prefix=$(abspath $(DECK_ELF)) --disable-debuginfod \
+			--disable-libdebuginfod --disable-programs --without-bzlib \
+			--without-lzma --without-zstd
+	$(MAKE) -C $(DECK_BUILD)/elfutils-0.193/lib libeu.a
+	$(MAKE) -C $(DECK_BUILD)/elfutils-0.193/libelf libelf.a
+	mkdir -p $(DECK_ELF)/libelf $(DECK_ELF)/lib
+	cp $(DECK_BUILD)/elfutils-0.193/libelf/libelf.a $(DECK_ELF)/libelf/
+	cp $(DECK_BUILD)/elfutils-0.193/lib/libeu.a $(DECK_ELF)/lib/
+
+deck-bundle: nsl-sw001.bpf.o $(DECK_ELF_LIBS)
+	@test -f /usr/lib64/libc.a || { echo "MISSING: glibc-static (sudo dnf install glibc-static)"; exit 1; }
+	@test -f /usr/lib64/libbpf.a || { echo "MISSING: libbpf-static (sudo dnf install libbpf-static)"; exit 1; }
+	@test -f /usr/lib64/libz.a || { echo "MISSING: zlib-ng-compat-static"; exit 1; }
+	@test -f /usr/lib64/libzstd.a || { echo "MISSING: libzstd-static"; exit 1; }
+	mkdir -p $(DECK_DIR)
+	$(CC) $(CFLAGS) -s -static -no-pie -o $(DECK_DIR)/sw001-bpf-attach $(DECK_LOADER) \
+		-lbpf $(DECK_ELF)/libelf/libelf.a $(DECK_ELF)/lib/libeu.a \
+		-lz -lzstd -lm
 	cp -L nsl-sw001.bpf.o $(DECK_DIR)/
-	@echo "--- deck bundle ready in $(DECK_DIR)/ (copy the whole steamdeck/ tree to the Deck)"
+	@file $(DECK_DIR)/sw001-bpf-attach
+	@echo "--- deck bundle ready in $(DECK_DIR)/: sw001-bpf-attach (statically linked) + nsl-sw001.bpf.o"
 
 clean:
 	rm -f nsl-sw001.bpf.o vmlinux.h tools/gen_vmlinux_h
-	rm -rf $(DECK_DIR)
+	rm -rf $(DECK_DIR) $(DECK_BUILD)

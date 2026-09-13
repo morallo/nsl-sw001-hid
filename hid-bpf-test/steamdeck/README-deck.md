@@ -16,10 +16,12 @@ with a **small self-contained loader** (`sw001-bpf-attach`) instead of the
 
 - **Never touches `/usr`** — nothing to unlock with `steamos-readonly`, nothing
   that dies on A/B updates.
-- **The loader + its bundled .so deps + the object live in `/home`**, which
+- **The loader + the object live in `/home`**, which
   SteamOS never prunes. After any update everything is still there.
-- **No pacman** (no keyring setup, no repo issues) — the loader is a ~20 kB
-  binary built once on the dev machine (`make deck-bundle`).
+- **No pacman** (no keyring setup, no repo issues) — the loader is a **statically
+  linked** binary (libbpf/libelf/libz/libzstd built in) made once on the dev
+  machine (`make deck-bundle`). Nothing to install, no `.so` to ship, no ABI
+  the Deck could mismatch.
 - The only `/etc` addition is the udev rule, and it is on the atomic-update
   keep-list. All live work (attach on connect) happens in udev, so there is
   **no boot service to keep running**.
@@ -43,7 +45,7 @@ rewrites the report descriptor and fakes the SPI calibration reads.
 | File | Purpose |
 |---|---|
 | `sw001-bpf-attach.c` | self-contained loader source (built off-Deck) |
-| `loader/` | staged bundle: loader binary + bundled `.so`s + `nsl-sw001.bpf.o` (`make deck-bundle`) |
+| `loader/` | staged bundle: statically-linked loader + `nsl-sw001.bpf.o` (`make deck-bundle`) |
 | `99-hid-bpf-nsl-sw001.rules` | udev rule pointing at the `/home` loader |
 | `install-nsl-sw001-bpf-deck.sh` | installer (pass `--uninstall` to remove) |
 | `nsl-sw001-bpf.conf` | keeps the `/etc` udev rule across A/B updates |
@@ -71,7 +73,7 @@ On a dev machine with clang + gcc + libbpf dev headers, build the object and
 the loader bundle; then copy the `steamdeck/` tree to the Deck and run:
 
 ```bash
-make deck-bundle   # in hid-bpf-test/: builds loader/ + bundles .so deps
+make deck-bundle   # in hid-bpf-test/: builds the statically-linked loader + object
 ./steamdeck/install-nsl-sw001-bpf-deck.sh
 ```
 
@@ -115,7 +117,7 @@ HIDAPI over hidraw).
 There is no boot service. The two things that must survive an update are both
 covered by the same mechanism:
 
-- `/home/.steamos-nsl-sw001-bpf/` holds the loader, bundled libs, object, the
+- `/home/.steamos-nsl-sw001-bpf/` holds the loader, object, the
   udev rule and the keep-list; `/home` is never pruned.
 - `/etc/udev/rules.d/99-hid-bpf-nsl-sw001.rules` is on the atomic-update
   keep-list (via `/etc/atomic-update.conf.d/nsl-sw001-bpf.conf`), so it stays
@@ -139,10 +141,11 @@ retries it; a `sudo udevadm trigger` also re-runs it.
   relocated — verify once after the first Deck boot (checks above). If the Deck
   kernel lacks a kfunc, the loader fails loudly and the controller just falls
   back to the current behaviour.
-- **`.so` versions**: the bundled libz/libzstd/libelf/libbpf are pinned to
-  whatever the dev machine shipped. They are stable across SteamOS kernels; a
-  future Deck glibc bump is covered by glibc forward compatibility. Re-stage
-  with `make deck-bundle` after a dev-machine update if you want to refresh.
+- **Build-time static libs**: `make deck-bundle` needs `glibc-static
+  libbpf-static libzstd-static zlib-ng-compat-static` installed on the dev
+  machine plus the `elfutils` source for `libelf.a`/`libeu.a` (built once into
+  `hid-bpf-test/.build/`, cached). The resulting binary is self-contained; a
+  future SteamOS glibc bump is covered by glibc forward compatibility.
 - **Genuine Pro Controllers** matching `057E:2009` are left untouched by the
   program: `hid_rdesc_fixup` skips any descriptor that already declares report
   `0x21`.
