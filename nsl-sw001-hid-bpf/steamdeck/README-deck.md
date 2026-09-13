@@ -73,7 +73,7 @@ On a dev machine with clang + gcc + libbpf dev headers, build the object and
 the loader bundle; then copy the `steamdeck/` tree to the Deck and run:
 
 ```bash
-make deck-bundle   # in hid-bpf-test/: builds the statically-linked loader + object
+make deck-bundle   # in nsl-sw001-hid-bpf/: builds the statically-linked loader + object
 ./steamdeck/install-nsl-sw001-bpf-deck.sh
 ```
 
@@ -81,17 +81,17 @@ Options:
 
 - `--uninstall` — remove seed, udev rule and keep-list entry.
 
-If the old kernel-module route (`install-nsl-sw001-deck.sh`) is detected, the
-installer **fully uninstalls it**: DKMS entry + source, the `/etc` artifacts
-(blacklist, modules-load, IMU uaccess rule, its atomic-update keep-list), the
-ensure unit, the `/home/.steamos-nsl-sw001` seed and the SDL env vars. A clean
-Deck that never had the module route installs standalone and needs nothing
-extra — the "uninstall" only fires when residue is found.
-
-The one thing a full uninstall cannot remove without a `steamos-readonly`
-unlock is the compiled `.ko` for the current kernel under the read-only
-`/usr/lib/modules`. It is inert (modprobe blacklist support gone, no
-auto-load entry, module unloaded) and disappears at the next A/B update.
+The installer does **not** uninstall the old kernel-module route, and it does
+not need to: a Deck that never had the module route installs standalone.  If
+that route *is* present it must be removed first, because its `hid_nintendo`
+blacklist (`/etc/modprobe.d/blacklist-hid-nintendo.conf`) and
+`SDL_HIDAPI_IGNORE_DEVICES` env vars would silently defeat the BPF route —
+run `install-nsl-sw001-deck.sh --uninstall` (removes the DKMS entry + source,
+the `/etc` artifacts, the ensure unit, the `/home` seed and the SDL env vars)
+before installing.  The one thing that may survive that uninstall is the
+compiled `.ko` for the current kernel under the read-only `/usr/lib/modules`
+(it can only be removed with a `steamos-readonly` unlock); it is inert once
+the `/etc` glue is gone and disappears at the next A/B update.
 
 After install, fully restart Steam, and **power-cycle the controller once** if
 it was connected during install (the report-descriptor rewrite only applies at
@@ -144,7 +144,7 @@ retries it; a `sudo udevadm trigger` also re-runs it.
 - **Build-time static libs**: `make deck-bundle` needs `glibc-static
   libbpf-static libzstd-static zlib-ng-compat-static` installed on the dev
   machine plus the `elfutils` source for `libelf.a`/`libeu.a` (built once into
-  `hid-bpf-test/.build/`, cached). The resulting binary is self-contained; a
+  `nsl-sw001-hid-bpf/.build/`, cached). The resulting binary is self-contained; a
   future SteamOS glibc bump is covered by glibc forward compatibility.
 - **Genuine Pro Controllers** matching `057E:2009` are left untouched by the
   program: `hid_rdesc_fixup` skips any descriptor that already declares report

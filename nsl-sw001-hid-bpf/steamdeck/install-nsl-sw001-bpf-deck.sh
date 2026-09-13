@@ -2,7 +2,7 @@
 #
 # Install / uninstall the N-SL SW001 HID-BPF program on SteamOS (Steam Deck).
 #
-# The BPF program (hid-bpf-test/nsl-sw001.bpf.o) makes the in-tree hid-nintendo
+# The BPF program (nsl-sw001-hid-bpf/nsl-sw001.bpf.o) makes the in-tree hid-nintendo
 # driver bind and work on the SW001 clone -- no custom kernel module, no DKMS,
 # no hid-nintendo blacklist.  It also fixes SDL's HIDAPI Switch driver (fakes
 # the stick/IMU SPI calibration reads and re-sends the short 0x10 rumble form),
@@ -73,9 +73,9 @@ run_root() { $SUDO "$@"; }
 # --- Locate the staged bundle (built with `make deck-bundle`) ----------------
 require_bundle() {
     [ -x "$LOADER_DIR/$LOADER" ] || \
-        die "steamdeck/loader/$LOADER not found; build it first (make deck-bundle in hid-bpf-test/)"
+        die "steamdeck/loader/$LOADER not found; build it first (make deck-bundle in nsl-sw001-hid-bpf/)"
     [ -f "$LOADER_DIR/$OBJ" ] || \
-        die "steamdeck/loader/$OBJ not found; build it first (make deck-bundle in hid-bpf-test/)"
+        die "steamdeck/loader/$OBJ not found; build it first (make deck-bundle in nsl-sw001-hid-bpf/)"
 }
 
 # --- Attach to any currently-connected SW001 ---------------------------------

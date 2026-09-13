@@ -1,4 +1,4 @@
-# hid-bpf-test: SW001 → hid-nintendo via a HID-BPF filter
+# nsl-sw001-hid-bpf: SW001 → hid-nintendo via a HID-BPF filter
 
 Experiment: replace the custom `hid-nsl-sw001` kernel module with a **HID-BPF**
 filter that makes the in-tree **`hid-nintendo`** driver bind and work on the
@@ -41,6 +41,11 @@ the stock descriptor should be the entire missing piece.
      faked read forwards the original output report AND injects a synthetic
      `0x21` subcmd reply; hid-nintendo's and SDL's synchronous waiters consume
      the injected reply first.
+   - answers the **subcmd `0x02` (request device info)** the same way: the
+     SW001 never replies to it, and SDL/Steam HIDAPI plus hid-nintendo
+     classify the controller from this reply. Steam Input gates the gyro
+     feature on getting a Pro Controller type, so the fake returns type `0x03`
+     (Pro) and this unit's BD_ADDR.
    - **rumble for HIDAPI mode**: SDL's HIDAPI Switch driver (BT) sends the
      rumble-only output report `0x10` zero-padded to its 49-byte Bluetooth
      packet size, which the SW001 ignores (it only reacts to short reports —
@@ -126,12 +131,13 @@ statically-linked loader** (`sw001-bpf-attach`, built off-Deck by
 `make deck-bundle`) instead of the `udev-hid-bpf` pacman package: no pacman, no
 `steamos-readonly` unlock, and no reinstall after A/B updates (loader + object
 live under `/home`, which SteamOS never prunes).  The installer writes the udev
-rule to `/etc` and adds it to the atomic-update keep-list, seeds
-`/home/.steamos-nsl-sw001-bpf/`, and removes the old kernel-module route if
-present (its `hid_nintendo` blacklist and `SDL_HIDAPI_IGNORE_DEVICES` would
-defeat the BPF route).  There is no boot service — the udev rule attaches on
-every controller (re)connect.  No build happens on the Deck — see
-`steamdeck/README-deck.md`.
+rule to `/etc` and adds it to the atomic-update keep-list, and seeds
+`/home/.steamos-nsl-sw001-bpf/`.  There is no boot service — the udev rule
+attaches on every controller (re)connect.  The installer does **not** touch an
+old kernel-module route install: that route's `hid_nintendo` blacklist and
+`SDL_HIDAPI_IGNORE_DEVICES` env vars would silently defeat the BPF route, so
+uninstall it first (`install-nsl-sw001-deck.sh --uninstall`).  No build happens
+on the Deck — see `steamdeck/README-deck.md`.
 
 ## Known limits of the BPF approach
 
