@@ -264,6 +264,9 @@ int BPF_PROG(sw001_fix_rdesc, struct hid_bpf_ctx *hctx)
  * requested address/length with canned, plausible calibration data.
  *
  * Covered areas:
+ *   - subcmd 0x02 request device info (the SW001 never answers it; SDL/Steam
+ *     HIDAPI and hid-nintendo classify the controller from this reply, and
+ *     Steam Input gates the gyro feature on getting a Pro Controller type)
  *   - stick user/factory cal (deltas matching the measured raw ranges:
  *     center 2048, X max-above 2036 / min-below 2048, Y max-above 2047 /
  *     min-below 2037, which also passes hid-nintendo's min<center<max check)
@@ -433,7 +436,32 @@ int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 	if (data[0] != 0x01)
 		return 0;
 
-	/* subcmd output report: byte 10 = subcmd id, 0x10 = SPI flash read */
+	/* subcmd output report: byte 10 = subcmd id
+	 * 0x02 = request device info (the SW001 never answers it; both SDL/Steam
+	 * HIDAPI and hid-nintendo classify the controller from this reply and
+	 * Steam Input uses it to decide the gyro feature is available -- a type
+	 * of 0x03 (Pro Controller) + this unit's BD_ADDR is what they expect).
+	 * Reply layout matches both consumers: ack 0x90 at byte 13, subcmd id at
+	 * 14, data at 15+ (device type at 17, MAC at 19..24). */
+	if (data[10] == 0x02) {
+		reply[0] = 0x21;
+		reply[13] = 0x90;	/* ACK + data following */
+		reply[14] = 0x02;
+		reply[15] = 0x02;	/* firmware version */
+		reply[16] = 0x40;
+		reply[17] = 0x03;	/* device type: Pro Controller */
+		reply[19] = 0x9c;	/* BD_ADDR of the connected unit */
+		reply[20] = 0x54;
+		reply[21] = 0x00;
+		reply[22] = 0x4c;
+		reply[23] = 0xc9;
+		reply[24] = 0x3b;
+		hid_bpf_try_input_report(hctx, HID_INPUT_REPORT, reply,
+					 sizeof(reply));
+		return 0;
+	}
+
+	/* 0x10 = SPI flash read */
 	if (data[10] != 0x10)
 		return 0;
 
