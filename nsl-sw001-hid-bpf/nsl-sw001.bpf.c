@@ -66,12 +66,10 @@ static bool sw001_is_clone;
  */
 #ifndef NSL_RUMBLE_ZERO_TOTAL
 /* Zero packets on a stop, incl. the first. The reliable dimension is the
- * SPAN of distinct sampling instances, not the packet count: 1 per tick,
- * TOTAL=20 (~200 ms) stopped every time. ZPT=2 with the same TOTAL shrank
- * the span to ~10 instances -> 95%. To go fast AND keep the span, raise
- * TOTAL instead, e.g. ZPT=2, TOTAL=36 = 17 pair-phases (~200 ms, denser
- * early coverage). */
-#define NSL_RUMBLE_ZERO_TOTAL	36
+ * SPAN of distinct sampling instances, not the packet count. 1 per tick,
+ * TOTAL=20 (~200 ms) is the verified 100% profile; every faster variant
+ * (tight burst at 8, 2-per-tick at 20 or 36) stuck intermittently. */
+#define NSL_RUMBLE_ZERO_TOTAL	20
 #endif
 /* Compile-time knob: pass BPF_CFLAGS=-DNSL_RUMBLE_STOP_CASCADE=0 to disable
  * the paced stop cascade entirely, leaving only SDL's single neutral write
@@ -81,11 +79,11 @@ static bool sw001_is_clone;
 #define NSL_RUMBLE_STOP_CASCADE 1
 #endif
 /* Zero reports per 0x30 tick while a stop is pending, 1..NSL_RUMBLE_ZERO_TOTAL.
- * 1 per tick with TOTAL=20 was the verified-reliable baseline (~200 ms).
- * 2 halves the number of distinct tick instances for a given TOTAL, so only
- * combine it with a raised NSL_RUMBLE_ZERO_TOTAL (see above). */
+ * MUST be 1: the SW001's zero-latch is per-window, so two zeros in one tick
+ * coalesce into a single distinct sample and never exceed one instance per
+ * tick -- 2-per-tick stuck intermittently regardless of TOTAL. */
 #ifndef NSL_ZEROS_PER_TICK
-#define NSL_ZEROS_PER_TICK 2
+#define NSL_ZEROS_PER_TICK 1
 #endif
 
 struct rumble_state {
@@ -390,7 +388,14 @@ int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 
 		st = bpf_map_lookup_elem(&sw001_rumble, &key0);
 		if (st && st->inited && !st->cb_ready) {
-			if (bpf_wq_set_callback(&st->wq, nsl_rumble_zero_cb, 0) == 0)
+			int cb_ret = -1;
+			if (bpf_wq_set_callback_impl)
+				cb_ret = bpf_wq_set_callback_impl(&st->wq,
+					nsl_rumble_zero_cb, 0, NULL);
+			else if (bpf_wq_set_callback)
+				cb_ret = bpf_wq_set_callback(&st->wq,
+					nsl_rumble_zero_cb, 0);
+			if (cb_ret == 0)
 				st->cb_ready = 1;
 		}
 

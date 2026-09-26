@@ -3,11 +3,10 @@ CLANG_STRIP ?= llvm-strip
 CFLAGS ?= -O2 -Wall
 BPF_CFLAGS ?= -O2 -g -Wall
 
-# Defaults: paced zero stop cascade on (NSL_RUMBLE_STOP_CASCADE=1), 36 zero
-# packets (NSL_RUMBLE_ZERO_TOTAL=36) delivered 2 per 0x30 tick
-# (NSL_ZEROS_PER_TICK=2): a ~200 ms span of pair-spaced zeros, denser early
-# than the proven 1-per-tick baseline. The proven-reliable profile is
-# `make NSL_RUMBLE_ZERO_TOTAL=20 NSL_ZEROS_PER_TICK=1`. Override with
+# Defaults: paced zero stop cascade on (NSL_RUMBLE_STOP_CASCADE=1), 20 zero
+# packets (NSL_RUMBLE_ZERO_TOTAL=20) delivered once per 0x30 tick
+# (NSL_ZEROS_PER_TICK=1): the verified 100% stop profile (~200 ms span).
+# NSL_ZEROS_PER_TICK must stay 1 (per-window latch). Override with
 # `make NSL_RUMBLE_STOP_CASCADE=0` to disable the cascade entirely.
 ifdef NSL_RUMBLE_STOP_CASCADE
 BPF_CFLAGS += -DNSL_RUMBLE_STOP_CASCADE=$(NSL_RUMBLE_STOP_CASCADE)
