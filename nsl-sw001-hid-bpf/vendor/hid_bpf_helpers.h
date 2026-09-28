@@ -5,7 +5,10 @@
 #define __HID_BPF_HELPERS_H
 
 #include "vmlinux.h"
+
 #include <bpf/bpf_helpers.h>
+
+
 #include <bpf/bpf_endian.h>
 #include <linux/errno.h>
 #include "hid_report_descriptor_helpers.h"
@@ -57,6 +60,15 @@ extern int bpf_wq_set_callback(struct bpf_wq *wq,
 extern int bpf_wq_set_callback_impl(struct bpf_wq *wq,
 		int (callback_fn)(void *map, int *key, void *value),
 		unsigned int flags, void *aux) __weak __ksym;
+
+/* No bpf_timer_* kfuncs are declared here on purpose. They look available --
+ * both this header and vmlinux.h carry typedefs for them -- but the BTF in
+ * the running kernel only describes them as 5-argument u64 stubs, so libbpf
+ * resolves the symbol and then rejects the call as an unresolvable kfunc
+ * (EINVAL at load, before the verifier sees anything). Measured on
+ * 7.2.6-201.nobara.fc44.x86_64; bpf_wq_* right above has real pointer-bearing protos
+ * and does resolve. The rumble watchdog therefore clocks itself off input
+ * reports instead. Re-check with tools/protodump before reintroducing them. */
 
 #define HID_MAX_DESCRIPTOR_SIZE	4096
 #define HID_IGNORE_EVENT	-1

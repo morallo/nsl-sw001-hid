@@ -54,11 +54,131 @@ the stock descriptor should be the entire missing piece.
      the hook is declared sleepable (`SEC("struct_ops.s/hid_hw_output_report")`,
      allowed by the kernel for that member) and the rdesc fixup declares 0x10
      as a 9-byte output report so the kfunc's report lookup/clamping matches
-     (`hid_report_len` = 10). SDL's periodic refresh keeps re-sending while the
-     effect is held, so the ~50 ms resend the SW001 needs is preserved.
-3. **`probe`** (syscall) — always matches; the loader runs it before attach
-    (udev-hid-bpf or `steamdeck/sw001-bpf-attach`) so it can stash the numeric
-    hid id in the rumble map for the workqueue callback.
+      (`hid_report_len` = 10). A single packet holds the motors until a
+      zero-amplitude report arrives: the SW001 latches the setpoint of the last
+      `0x10` it receives and **has no self-timeout** — a non-zero report with no
+      zero behind it runs the motors *indefinitely*, not for a few seconds.
+      Note that "zero amplitude" is a specific encoding (`0x00 0x40` per motor,
+      what SDL sends as `00 01 40 40`); an all-zero rumble field is an
+      undecodable packet, not a stop.
+
+    - **A zero-amplitude report is discarded if it arrives in the same sampling
+      window as the last non-zero one, and the motors latch on forever.** This
+      is the important result, and it is the whole reason rumble does not work
+      from Steam. The hardware samples the setpoint on a ~50 ms cadence; a zero
+      that lands in the window which already carried a non-zero setpoint is
+      dropped, so the controller keeps the last amplitude it accepted. Only a
+      zero landing in a *later* window stops the motors. Measured, with the stop
+      deliberately issued 30 ms after the last active packet (i.e. in-cadence):
+
+      | stop sent | outcome |
+      |---|---|
+      | 1 zero, 30 ms after last active (in-cadence) | **fails, motors latch indefinitely** |
+      | 1 zero, 500 ms after last active (out of cadence) | stops |
+      | 5 zeros back-to-back, 30 ms after | stops *sometimes* |
+      | 5 zeros 50 ms apart, 30 ms after | **stops every time** |
+
+      The back-to-back case is the tell: every copy lands in the same window as
+      the active packet, so repetition cannot substitute for spacing. The
+      kernel driver's own rumble worker is what normally supplies that spacing,
+      which is why the clone sends 5 zero reports 50 ms apart.
+
+      **Steam sends exactly one zero per click, 30–48 ms after its last active
+      packet — so Steam's stop is always mistimed and never works.** A 87 s
+      btmon capture across 39 clicks / 285 rumble reports found 39 bursts, every
+      one ending in a byte-perfect `00 01 40 40 00 01 40 40`, 285/285 packets
+      well-formed, one distinct active payload, steady 50.0 ms spacing — and the
+      motors latched anyway, because a *correct* stop in the *wrong* window is
+      not a stop. The packet log alone will never show this defect; it is only
+      visible as a motor that keeps turning.
+   - **SDL does not end an effect when its duration elapses.** SDL's HIDAPI
+     driver keeps no duration, so `SDL_JoystickRumble`'s `duration_ms` is
+     dropped and only an explicit `rumble(0, 0)` stops the motors. SDL2 has no
+     `SDL_GameControllerStopRumble` at all, so writing the zeros is the
+      caller's job. Any game that stops asking for rumble without zeroing it
+      leaves a non-genuine *or* genuine controller buzzing indefinitely, and no
+      amount of translation work in this file can catch that: the failure mode
+      is that no further output report ever arrives.
+    - **the paced stop needs a clock, and `bpf_timer` is the one that works.**
+      A host that stops asking for rumble without zeroing it leaves the motors
+      running forever, so something must send zeros after the host goes quiet.
+      BPF cannot sleep and `bpf_wq_start` takes no delay argument, so the wq
+      callback can only be the thing that *performs* the write; the pacing has
+      to come from a timer. The design is a `bpf_timer` at
+      `JC_RUMBLE_PERIOD_MS` (50 ms) whose callback is non-sleepable and so only
+      kicks a sleepable `bpf_wq` callback, which does the actual
+      `hid_bpf_hw_output_report()`. Verified on the wire: 10 consecutive Steam
+      clicks, each followed by exactly 5 zero reports at 50/50/50/50 ms, 10/10.
+
+      **A note on `make check-kfuncs`, which is now known to be unsound for
+      this:** it resolves kfuncs by *name* against vmlinux BTF, which finds
+      whatever prototype the kernel publishes under that name rather than the
+      `bpf_kfunc` id the program actually references. On 7.2.6-201.nobara.fc44
+      it reports `bpf_timer_init` as `nargs=5 int int int int int -> STUB, not
+      callable` — and the timer works anyway. Treat that verdict as advisory
+      only; the load is the ground truth, and a "not callable" line is not
+      evidence that a call will fail to resolve. Do not delete working timer
+      code on the strength of that output.
+    - **`struct_ops/hid_device_event` must not be used on this device.** It
+      attaches, but calling it is a kernel NULL deref: `BUG: kernel NULL pointer
+      dereference` at `dispatch_hid_bpf_device_event+0xb8`, `memcpy` with
+      `RDI: 0x10` and `RCX: 0x31` (the 49-byte 0x30 report). The precondition is
+      hid-nintendo's probe failing (`probe with driver nintendo failed with error
+      -110`), so no valid report data exists yet HID-BPF dispatches anyway. It
+      faults before our program is entered, so no program body can avoid it. The
+      resulting Oops leaves bluetoothd in D state ("exited with irqs disabled")
+      and needs a reboot. This is also why the controller's own `0x30` input
+      stream — which arrives at 97–100 Hz and would otherwise be the natural
+      clock — cannot be used: the only hook that runs on input reports is the one
+      that crashes. The `bpf_timer` above is the workaround.
+    - **the driver's 5 x 50 ms cascade exists, but the hidraw path bypasses it,
+      so the hidraw path has no pacing at all.** hid-nintendo arms a 5-packet
+      zero countdown on any non-zero amplitude
+      (`JC_RUMBLE_ZERO_AMP_PKT_CNT = 5`) and drains it one packet per
+      `JC_RUMBLE_PERIOD_MS = 50` ms window from a sleepable workqueue. That is
+      correct, and it is what makes rumble work on `/dev/input/event21` (which
+      exposes `FF_RUMBLE`). It is simply not in the code path we care about:
+      Steam and SDL use hidraw, where `hid_send_report()` falls through to
+      `hid_hw_output_report()` because uhid has no `send_report`, so the
+      driver's rumble worker never sees the report. Measured, not inferred: in
+      the 87 s capture the controller's `0x30` input reports kept arriving at
+      97–100 Hz throughout and after Steam's stop — the countdown's driver
+      *was* awake and being fed — yet **zero** driver-generated zero reports
+      ever appeared on the wire. So on hidraw the countdown is never armed, and
+      an earlier version of this file that described the driver as "already
+      pacing the stop" was describing a path Steam does not take.
+
+    - **SOLVED: the paced stop is implemented here, in BPF, with a `bpf_timer`.**
+      This is the fix for the latch. When the host sends a zero-amplitude
+      report, this file does not rely on that one report landing correctly —
+      it arms a 50 ms timer and emits 5 zero reports of its own, one per timer
+      tick, so at least one of them is guaranteed to reach a fresh sampling
+      window. A generation counter invalidates a queued write if a newer
+      non-zero rumble or stop supersedes it, and a stale pin is replaced on
+      reconnect. The `sw001_rumble` map holding the timer/wq state is pinned
+      alongside the struct_ops link by the loader, because a map containing a
+      `bpf_timer` needs a userspace reference to outlive the loading process.
+
+      Verified on the wire via btmon (`diagnostic_scripts/capture_rumble_btmon.sh`
+      + `analyze_rumble_btmon.py`): 10 consecutive Steam clicks, each followed
+      by exactly 5 zero reports at 50/50/50/50 ms — 10/10, zero failures. The
+      trailing single "burst ending on an active report" in that capture is the
+      capture being cut off mid-click, not a missed stop.
+
+      The recovery path for an already-latched motor is still
+      `python3 ../diagnostic_scripts/test_rumble.py --stop 10`, but with the
+      cascade in place a latched motor should no longer be reachable through
+      normal use.
+
+      Rejected along the way, recorded so they are not retried:
+      - Subcommand `0x48` (disable vibration) does **not** clear a latched
+        rumble, re-tested with a decodable neutral payload so the subcommand was
+        the only variable.
+      - Repeating the zero back-to-back is not a substitute for spacing: 5
+        back-to-back copies land in the same window as the active packet and
+        stop the motor only *sometimes*. Only pacing works.
+      - The controller has **no self-decay**; a non-zero report with no stop
+        behind it runs the motors indefinitely.
 
 hid-nintendo then does all the rest itself: gamepad + IMU input devices,
 factory IMU calibration (gyro scale 15335, from the faked `0x6020` read),

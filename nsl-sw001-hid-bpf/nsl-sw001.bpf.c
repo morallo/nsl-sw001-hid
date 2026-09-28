@@ -32,116 +32,6 @@ char _license[] SEC("license") = "GPL";
  * controllers, which serve their own real calibration. */
 static bool sw001_is_clone;
 
-/*
- * SW001 rumble-stop cascade.
- *
- * The SW001 latches the rumble setpoint of the last 0x10 report it received;
- * a single zero-amplitude 0x10 does not silence it (SDL HIDAPI sends exactly
- * one stop report and then goes quiet, so its rumble "sticks" for a while).
- *
- * Delivery must be TIME-SPACED: a µs-burst of zero reports all lands inside
- * one of the controller's rumble-sampling windows and can be missed entirely
- * ("stuck in vibration"). hid-nintendo's FF needs ~5 zero reports spaced
- * 50 ms apart before the motors stop.
- *
- * There is no way to delay a report from the kernel here: this kernel has no
- * sleepable bpf_timer (bpf_timer_set_sleepable_cb is absent), and bpf_wq_start
- * takes no delay. Instead the controller's OWN 0x30 input stream (continuous,
- * ~every 15 ms) is used as a pacemaker: a struct_ops hid_device_event hook
- * fires on every input report while a stop is pending and schedules the wq to
- * send one zero report. No output happens from the input-path context (a BT
- * HIDP output can block on the L2CAP socket lock, so the kernel-side input
- * thread must never send); the hook only calls bpf_wq_start, which is safe
- * from any context. The wq callback does the actual (sleepable) output.
- *
- * The state map is only written when the SDL padded 0x10 form is seen, so
- * genuine Pro Controllers (hid-nintendo 10-byte 0x10, own FF countdown) are
- * untouched.
- *
- * A bpf_wq is used instead of a bpf_timer to DO the output because the
- * workqueue callback runs in a sleepable context -- hid_bpf_hw_output_report
- * is KF_SLEEPABLE. udev-hid-bpf pins every map to bpffs when loading, which
- * keeps map->usercnt > 0 (bpf_wq_init returns -EPERM otherwise), so the wq
- * survives the one-shot loader exiting.
- */
-#ifndef NSL_RUMBLE_ZERO_TOTAL
-/* Zero packets on a stop, incl. the first. The reliable dimension is the
- * SPAN of distinct sampling instances, not the packet count. 1 per tick,
- * TOTAL=20 (~200 ms) is the verified 100% profile; every faster variant
- * (tight burst at 8, 2-per-tick at 20 or 36) stuck intermittently. */
-#define NSL_RUMBLE_ZERO_TOTAL	20
-#endif
-/* Compile-time knob: pass BPF_CFLAGS=-DNSL_RUMBLE_STOP_CASCADE=0 to disable
- * the paced stop cascade entirely, leaving only SDL's single neutral write
- * (i.e. the pre-fix "stuck" behavior). The wq init and the short report
- * translation stay in the build either way. */
-#ifndef NSL_RUMBLE_STOP_CASCADE
-#define NSL_RUMBLE_STOP_CASCADE 1
-#endif
-/* Zero reports per 0x30 tick while a stop is pending, 1..NSL_RUMBLE_ZERO_TOTAL.
- * MUST be 1: the SW001's zero-latch is per-window, so two zeros in one tick
- * coalesce into a single distinct sample and never exceed one instance per
- * tick -- 2-per-tick stuck intermittently regardless of TOTAL. */
-#ifndef NSL_ZEROS_PER_TICK
-#define NSL_ZEROS_PER_TICK 1
-#endif
-
-struct rumble_state {
-	struct bpf_wq wq;		/* stays live for session lifetime */
-	__u32 hid_id;			/* for hid_bpf_allocate_context() */
-	__u32 stop_countdown;		/* zero packets still to send */
-	__u8 cb_ready;
-	__u8 inited;
-	__u8 rumble_ctr;		/* monotonic packet number for zero reports */
-};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct rumble_state);
-} sw001_rumble SEC(".maps");
-
-/* Sends ONE zero-amplitude 0x10 report. Pure sender: pacing is done by
- * sw001_tick_stop (one call per input report) and the single immediate
- * start from sw001_fake_spi on the stop. */
-static int nsl_rumble_zero_cb(void *map, int *key, void *value)
-{
-	struct rumble_state *st = (struct rumble_state *)value;
-	struct hid_bpf_ctx *hctx;
-	__u8 zero[10];
-
-	if (!st)
-		return 0;
-
-	/* A payload of eight raw zero bytes is NOT a valid "off" for the
-	 * SW001: it decodes the dekuNukem high/low freq + amplitude fields
-	 * and treats an all-zero rumble field as undefined, keeping the last
-	 * setpoint (verified: a 5-packet all-zero burst did not stop the
-	 * motors). Send the real zero-amplitude encoding instead, which is
-	 * byte-identical to SDL's set-neutral and hid-nintendo's amp=0
-	 * encode: {0x00, 0x0040} per motor (freq bytes with amp bits 0). */
-	zero[0] = 0x10;
-	zero[1] = st->rumble_ctr++;
-	zero[2] = 0x00;
-	zero[3] = 0x01;
-	zero[4] = 0x40;
-	zero[5] = 0x40;
-	zero[6] = 0x00;
-	zero[7] = 0x01;
-	zero[8] = 0x40;
-	zero[9] = 0x40;
-
-	hctx = hid_bpf_allocate_context(st->hid_id);
-	if (!hctx)
-		return 0;
-
-	hid_bpf_hw_output_report(hctx, zero, sizeof(zero));
-
-	hid_bpf_release_context(hctx);
-
-	return 0;
-}
 
 HID_BPF_CONFIG(
 	HID_DEVICE(BUS_BLUETOOTH, HID_GROUP_ANY, 0x057e, 0x2009),
@@ -225,16 +115,6 @@ int BPF_PROG(sw001_fix_rdesc, struct hid_bpf_ctx *hctx)
 
 	sw001_is_clone = true;
 
-	/* Init the wq here rather than lazily: rdesc_fixup runs while
-	 * udev-hid-bpf still holds the map fds (map->usercnt > 0 is required
-	 * by bpf_wq_init), and this is the only clone-gated one-shot point. */
-	{
-		__u32 key = 0;
-		struct rumble_state *st = bpf_map_lookup_elem(&sw001_rumble, &key);
-
-		if (st && !st->inited && bpf_wq_init(&st->wq, &sw001_rumble, 0) == 0)
-			st->inited = 1;
-	}
 
 	return off + sizeof(sw001_rdesc_extra);
 }
@@ -348,6 +228,237 @@ static const __u8 sw001_imu_factory_cal[24] = {
 	0xe7, 0x3b, 0xe7, 0x3b, 0xe7, 0x3b,	/* gyro scale X/Y/Z */
 };
 
+/*
+ * Rumble stop handling.
+ *
+ * The SW001 accepts the Nintendo neutral rumble packet, but a neutral 0x10
+ * sent too soon after the preceding output (< ~30 ms on this unit) can be
+ * ignored. hid-nintendo avoids this by keeping a five-packet zero-amplitude
+ * stop sequence alive on a 50 ms cadence.
+ *
+ * We reproduce that behavior here for the SDL HIDAPI path:
+ *
+ *   host stop 0x10 -> send neutral immediately (packet #1)
+ *                  -> send four more neutral reports, 50 ms apart
+ *
+ * Thus every stop request produces five neutral reports in total. A later
+ * non-zero rumble cancels the outstanding cascade. A later stop request
+ * starts a fresh five-packet sequence and restarts the 50 ms spacing.
+ *
+ * bpf_wq_start() itself has no delay argument, so it cannot provide the
+ * 50 ms pacing. We use a bpf_timer as the clock and a sleepable bpf_wq
+ * callback for the actual hid_bpf_hw_output_report() call. The timer is
+ * re-armed only after a synthetic neutral report has been sent, so the
+ * spacing is measured from the previous output rather than from the timer
+ * callback's scheduling point.
+ *
+ * Both bpf_timer and bpf_wq are available in the SteamOS 3.8 / Linux 7.2
+ * and Fedora / Linux 7.4 kernels targeted by this program. bpf_wq callbacks
+ * are sleepable, which is required by hid_bpf_hw_output_report().
+ */
+
+#ifndef NSL_RUMBLE_STOP_PKT_CNT
+#define NSL_RUMBLE_STOP_PKT_CNT	5
+#endif
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+#ifndef NSL_RUMBLE_PERIOD_NS
+#define NSL_RUMBLE_PERIOD_NS	50000000ULL	/* 50 ms */
+#endif
+
+/* A stop request sends one report synchronously, so the timer-driven
+ * cascade has four reports left to send. */
+#define NSL_RUMBLE_STOP_REMAINING \
+	(NSL_RUMBLE_STOP_PKT_CNT - 1)
+
+struct rumble_state {
+	struct bpf_timer timer;
+	struct bpf_wq wq;
+
+	/* HID device ID used by hid_bpf_allocate_context(). */
+	__u32 hid_id;
+
+	/* Number of timer-driven neutral reports still required. */
+	__u32 stop_remaining;
+
+	/* Incremented for every new host rumble command. A queued work item
+	 * from an older stop sequence becomes stale when this changes. */
+	__u32 generation;
+	__u32 work_generation;
+
+	/* Nintendo output-report packet number for synthetic 0x10 reports. */
+	__u8 rumble_ctr;
+
+	__u8 wq_ready;
+	__u8 timer_ready;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct rumble_state);
+} sw001_rumble SEC(".maps");
+
+static __always_inline bool nsl_is_neutral_rumble(const __u8 *r)
+{
+	/* SDL's Nintendo neutral state:
+	 *   00 01 40 40 00 01 40 40
+	 *
+	 * Do not classify an all-zero field as neutral: the SW001 ignores that
+	 * undecodable encoding rather than treating it as silence. */
+	return r[0] == 0x00 && r[1] == 0x01 &&
+	       r[2] == 0x40 && r[3] == 0x40 &&
+	       r[4] == 0x00 && r[5] == 0x01 &&
+	       r[6] == 0x40 && r[7] == 0x40;
+}
+
+static __always_inline void nsl_make_neutral(__u8 *report, __u8 packet_num)
+{
+	report[0] = 0x10;
+	report[1] = packet_num;
+
+	report[2] = 0x00;
+	report[3] = 0x01;
+	report[4] = 0x40;
+	report[5] = 0x40;
+
+	report[6] = 0x00;
+	report[7] = 0x01;
+	report[8] = 0x40;
+	report[9] = 0x40;
+}
+
+/* The timer callback cannot call hid_bpf_hw_output_report() directly because
+ * the timer callback is non-sleepable. It only kicks the sleepable workqueue
+ * callback, which performs the actual HID output. */
+static int nsl_rumble_timer_cb(void *map, int *key,
+				       struct rumble_state *st)
+{
+	int ret;
+
+	(void)map;
+	(void)key;
+
+	if (!st || st->stop_remaining == 0 || !st->wq_ready)
+		return 0;
+
+	/* Snapshot the generation which this work item belongs to. */
+	st->work_generation = st->generation;
+
+	ret = bpf_wq_start(&st->wq, 0);
+	if (ret) {
+		/* Timer callbacks are async callbacks. Their return value must be
+		 * a verifier-known constant zero; never return bpf_wq_start()'s
+		 * error directly. Retry the workqueue kick on the next period. */
+		bpf_timer_start(&st->timer, NSL_RUMBLE_PERIOD_NS, 0);
+	}
+
+	return 0;
+}
+
+/* Send one synthetic neutral report from a sleepable bpf_wq callback. */
+static int nsl_rumble_wq_cb(void *map, int *key, void *value)
+{
+	struct rumble_state *st = (struct rumble_state *)value;
+	struct hid_bpf_ctx *hctx;
+	__u8 zero[10];
+	__u32 generation;
+	int ret;
+
+	(void)map;
+	(void)key;
+
+	if (!st || st->stop_remaining == 0)
+		return 0;
+
+	generation = st->work_generation;
+
+	/* A non-zero rumble or a newer stop request superseded this queued
+	 * work item before it got to the HID write. */
+	if (generation != st->generation)
+		return 0;
+
+	hctx = hid_bpf_allocate_context(st->hid_id);
+	if (!hctx)
+		return 0;
+
+	nsl_make_neutral(zero, st->rumble_ctr);
+
+	ret = hid_bpf_hw_output_report(hctx, zero, sizeof(zero));
+
+	hid_bpf_release_context(hctx);
+
+	/* Re-check the generation after the potentially blocking HID output.
+	 * If a new host rumble arrived meanwhile, never touch its state or arm
+	 * another old stop timer. The already-issued zero is the only possible
+	 * stale report in that race. */
+	if (generation != st->generation)
+		return 0;
+
+	if (ret == (int)sizeof(zero)) {
+		st->rumble_ctr = (st->rumble_ctr + 1) & 0x0f;
+		if (st->stop_remaining > 0)
+			st->stop_remaining--;
+
+		if (st->stop_remaining > 0)
+			/* Pace the NEXT output from this successful output. */
+			bpf_timer_start(&st->timer, NSL_RUMBLE_PERIOD_NS, 0);
+	} else if (st->stop_remaining > 0) {
+		/* Do not consume a report on failure. Retry on the same 50 ms
+		 * cadence instead of turning a transient error into a shortened
+		 * stop cascade. */
+		bpf_timer_start(&st->timer, NSL_RUMBLE_PERIOD_NS, 0);
+	}
+
+	/* bpf_wq callbacks are asynchronous callbacks as well. Their return
+	 * value must be the verifier-known constant zero; ret is only used
+	 * internally to decide whether the successful report consumed one
+	 * stop packet. */
+	return 0;
+}
+
+/* Lazily initialize the timer/workqueue the first time a rumble report for
+ * the clone passes through. Keeping initialization here avoids requiring a
+ * separate userspace SEC("syscall") initializer. */
+static __always_inline int nsl_rumble_init(struct rumble_state *st,
+					   __u32 hid_id)
+{
+	int ret;
+
+	st->hid_id = hid_id;
+
+	if (!st->wq_ready) {
+		ret = bpf_wq_init(&st->wq, &sw001_rumble, 0);
+		if (ret && ret != -EBUSY)
+			return ret;
+
+		ret = bpf_wq_set_callback(&st->wq, nsl_rumble_wq_cb, 0);
+		if (ret)
+			return ret;
+
+		st->wq_ready = 1;
+	}
+
+	if (!st->timer_ready) {
+		ret = bpf_timer_init(&st->timer, &sw001_rumble,
+					     CLOCK_MONOTONIC);
+		if (ret && ret != -EBUSY)
+			return ret;
+
+		ret = bpf_timer_set_callback(&st->timer, nsl_rumble_timer_cb);
+		if (ret)
+			return ret;
+
+		st->timer_ready = 1;
+	}
+
+	return 0;
+}
+
 SEC("struct_ops.s/hid_hw_output_report")
 int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 {
@@ -379,61 +490,78 @@ int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 	 * hidraw_write reports a full success to SDL. The 10-byte re-send
 	 * re-enters this hook (size < 16) and is passed through to the device. */
 	if (data[0] == 0x10) {
-		struct rumble_state *st = NULL;
+		struct rumble_state *st;
 		__u32 key0 = 0;
+		__u32 generation = 0;
+		bool is_stop;
+		int init_ret;
+		int send_ret;
 
 		short_rumble[0] = data[0];
 		short_rumble[1] = data[1];
 		__builtin_memcpy(short_rumble + 2, data + 2, 8);
 
+		is_stop = nsl_is_neutral_rumble(short_rumble + 2);
 		st = bpf_map_lookup_elem(&sw001_rumble, &key0);
-		if (st && st->inited && !st->cb_ready) {
-			int cb_ret = -1;
-			if (bpf_wq_set_callback_impl)
-				cb_ret = bpf_wq_set_callback_impl(&st->wq,
-					nsl_rumble_zero_cb, 0, NULL);
-			else if (bpf_wq_set_callback)
-				cb_ret = bpf_wq_set_callback(&st->wq,
-					nsl_rumble_zero_cb, 0);
-			if (cb_ret == 0)
-				st->cb_ready = 1;
+
+		if (st) {
+			init_ret = nsl_rumble_init(st, hctx->hid->id);
+
+			/* Every host rumble command starts a new generation. A
+			 * non-zero command therefore cancels any old stop cascade. A
+			 * stop command replaces the old sequence and resets its count. */
+			st->generation++;
+			generation = st->generation;
+			st->rumble_ctr = (data[1] + 1) & 0x0f;
+
+			if (is_stop && init_ret == 0)
+				/* Five reports are required. The host packet below is
+				 * the first one, and is consumed from the count only if
+				 * the short re-send succeeds. */
+				st->stop_remaining = NSL_RUMBLE_STOP_PKT_CNT;
+			else
+				/* A non-zero rumble immediately cancels any old cascade. */
+				st->stop_remaining = 0;
+		} else {
+			init_ret = -1;
 		}
 
-		if (hid_bpf_hw_output_report(hctx, short_rumble,
-					     sizeof(short_rumble)) != (int)sizeof(short_rumble))
-			/* kfunc failed: forward the original unchanged (SDL's padded
-			 * form, i.e. today's behavior) rather than dropping it. */
-			return 0;
+		/* SDL's HIDAPI Switch driver sends the BT 0x10 report padded to
+		 * 49 bytes. The SW001 only accepts the short 10-byte form. */
+		send_ret = hid_bpf_hw_output_report(hctx, short_rumble,
+					      sizeof(short_rumble));
 
-		#if NSL_RUMBLE_STOP_CASCADE
-		if (st && st->inited && st->cb_ready) {
-			bool zero_amp;
-			__u8 i;
+		if (st && generation != st->generation)
+			/* A newer host command arrived while the output was in flight.
+			 * That newer command owns the rumble state now. */
+			return hctx->size;
 
-			/* Amplitude lives in the low 3 bits of bytes 0 and 2 of
-			 * each motor's 4-byte group (dekuNukem encoding, same as
-			 * hid-nintendo). SDL's set-neutral write is
-			 * {0x00,0x01,0x40,0x40} per motor -- not all-zero bytes --
-			 * so test the amplitude bits, not the raw bytes. */
-			zero_amp = true;
-			for (i = 0; i < 8; i += 2)
-				zero_amp &= (short_rumble[2 + i] & 0x07) == 0;
-
-			if (zero_amp) {
-				/* The first two zero reports (SDL's neutral
-				 * resend + one immediate wq start) go out now;
-				 * sw001_tick_stop pumps the rest, paced by the
-				 * controller's own 0x30 stream so the SW001
-				 * holds a zero setpoint across its sampling
-				 * windows instead of a single missed burst. */
-				st->stop_countdown = NSL_RUMBLE_ZERO_TOTAL - 2;
-				bpf_wq_start(&st->wq, 0);
-			} else {
-				/* New amplitude: kill a pending cascade. */
-				st->stop_countdown = 0;
+		if (send_ret != (int)sizeof(short_rumble)) {
+			/* kfunc failed: preserve the current behavior and let hid-core
+			 * forward the original padded report rather than reporting a
+			 * short write to SDL. For a stop request, keep all five paced
+			 * attempts because this synchronous attempt did not succeed. */
+			if (st && init_ret == 0) {
+				if (is_stop) {
+					st->stop_remaining = NSL_RUMBLE_STOP_PKT_CNT;
+					bpf_timer_start(&st->timer, NSL_RUMBLE_PERIOD_NS, 0);
+				} else {
+					st->stop_remaining = 0;
+				}
 			}
+			return 0;
 		}
-#endif
+
+		if (st && init_ret == 0 && is_stop) {
+			/* The just-sent host packet is neutral #1. Consume it from the
+			 * count, leaving four reports for the 50 ms timer cascade. */
+			if (st->stop_remaining > 0)
+				st->stop_remaining--;
+
+			if (st->stop_remaining > 0)
+				bpf_timer_start(&st->timer,
+						 NSL_RUMBLE_PERIOD_NS, 0);
+		}
 
 		return hctx->size;
 	}
@@ -510,62 +638,8 @@ int BPF_PROG(sw001_fake_spi, struct hid_bpf_ctx *hctx)
 }
 
 /* udev-hid-bpf runs this to decide whether the device matches. */
-SEC("syscall")
-int probe(struct hid_bpf_probe_args *ctx)
-{
-	__u32 key = 0;
-	struct rumble_state *st;
-
-	ctx->retval = 0;
-
-	/* hid_bpf_allocate_context() keys on the numeric hid id; the wq
-	 * callback has no hctx, so grab it here (runs before any hook). */
-	st = bpf_map_lookup_elem(&sw001_rumble, &key);
-	if (st)
-		st->hid_id = ctx->hid;
-
-	return 0;
-}
-
-/*
- * Rumble-stop pacemaker. Fires on every input report while a stop cascade is
- * pending and schedules one zero-amplitude 0x10 per incoming 0x30 report, so
- * the controller sees a zero setpoint at (approximately) its own sampling
- * cadence for a few hundred ms instead of one µs-burst. Only schedules the
- * wq -- never sends output from the input-path context (BT HIDP socket lock).
- */
-SEC("struct_ops/hid_device_event")
-int BPF_PROG(sw001_tick_stop, struct hid_bpf_ctx *hctx,
-	     enum hid_report_type report_type, u64 timestamp_ns)
-{
-	struct rumble_state *st;
-	__u32 key0 = 0;
-
-	(void)hctx;
-	(void)timestamp_ns;
-
-	if (!sw001_is_clone || report_type != HID_INPUT_REPORT)
-		return 0;
-
-	st = bpf_map_lookup_elem(&sw001_rumble, &key0);
-	if (!st || !st->inited || !st->cb_ready || st->stop_countdown == 0)
-		return 0;
-
-	{
-		__u8 i;
-		__u8 n = st->stop_countdown < NSL_ZEROS_PER_TICK ?
-			    st->stop_countdown : (__u8)NSL_ZEROS_PER_TICK;
-
-		st->stop_countdown -= n;
-		for (i = 0; i < n; i++)
-			bpf_wq_start(&st->wq, 0);
-	}
-
-	return 0;
-}
 
 HID_BPF_OPS(sw001) = {
 	.hid_rdesc_fixup = (void *)sw001_fix_rdesc,
 	.hid_hw_output_report = (void *)sw001_fake_spi,
-	.hid_device_event = (void *)sw001_tick_stop,
 };

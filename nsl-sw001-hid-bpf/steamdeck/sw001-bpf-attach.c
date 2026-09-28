@@ -9,9 +9,14 @@
  *   1. patches the struct_ops map value's hid_id (first field of
  *      struct hid_bpf_ops, offset 0) with the numeric HID id parsed from
  *      the device sysfs name (the trailing %04X of "0005:057E:2009.000A"),
- *   2. runs the object's SEC("syscall") probe program via BPF_PROG_TEST_RUN
- *      (the probe stashes hid_id for the rumble-stop workqueue callback),
- *   3. calls bpf_map__attach_struct_ops() and pins the link under
+ *   2. pins the rumble-state map (which contains bpf_timer/bpf_wq) under
+ *      /sys/fs/bpf/hid/ so timer callbacks remain alive after this process
+ *      exits (the kernel requires a userspace reference to maps containing
+ *      bpf_timer),
+ *   3. runs the object's SEC("syscall") probe program via BPF_PROG_TEST_RUN
+ *      if it has one (it does: the rumble watchdog needs the numeric hid id,
+ *      which its wq callback cannot read for itself),
+ *   4. calls bpf_map__attach_struct_ops() and pins the link under
  *      /sys/fs/bpf/hid/ so it stays attached after this process exits.
  *
  * Build (dev machine only, Deck gets the prebuilt binary): the loader is
@@ -115,6 +120,7 @@ int main(int argc, char **argv)
 {
 	struct bpf_object *obj = NULL;
 	struct bpf_map *m = NULL;
+	struct bpf_map *rumble_map = NULL;
 	struct bpf_program *probe;
 	struct bpf_link *link;
 	struct hid_bpf_probe_args args = { 0 };
@@ -123,6 +129,8 @@ int main(int argc, char **argv)
 	size_t vsz = 0;
 	void *v;
 	char pinpath[512];
+	char mappath[512];
+	char pindir[512];
 	size_t pinlen, lastslash;
 	int err;
 
@@ -178,9 +186,76 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Run SEC("syscall") probe so the program stores hid_id into its rumble
-	 * map (the wq callback needs it).  Best effort: this sets nothing if the
-	 * object has no probe section. */
+	/*
+	 * bpf_timer_init()/bpf_timer_set_callback() require the containing map
+	 * to have at least one userspace reference. The loader owns that
+	 * reference while this process is alive, but bpf_object__close() below
+	 * drops it. Pin the rumble map now so its timer can remain active after
+	 * the loader exits.
+	 *
+	 * Only the ARRAY map containing the timer/workqueue state is pinned.
+	 * The struct_ops map/link has its own lifetime through the pinned link.
+	 */
+	rumble_map = bpf_object__find_map_by_name(obj, "sw001_rumble");
+	if (!rumble_map) {
+		fprintf(stderr,
+			"sw001-bpf-attach: object has no sw001_rumble map\n");
+		return 1;
+	}
+
+	/*
+	 * Build the per-device bpffs directory before pinning either the map
+	 * or the struct_ops link.
+	 */
+	if (access(BPFFS_ROOT, F_OK)) {
+		if (mount("bpf", BPFFS_ROOT, "bpf", 0, NULL) && errno != EBUSY) {
+			fprintf(stderr, "sw001-bpf-attach: mount %s failed: %s\n",
+				BPFFS_ROOT, strerror(errno));
+			return 1;
+		}
+	}
+
+	snprintf(pindir, sizeof pindir, "%s/", PIN_ROOT);
+	pinlen = strlen(pindir);
+	base = strrchr(devpath, '/');
+	base = base ? base + 1 : devpath;
+
+	for (const char *c = base; *c; c++) {
+		if (pinlen + 2 >= sizeof pindir) {
+			fprintf(stderr,
+				"sw001-bpf-attach: device pin path is too long\n");
+			return 1;
+		}
+		pindir[pinlen++] = (*c == ':' || *c == '.') ? '_' : *c;
+	}
+	pindir[pinlen] = '\0';
+
+	mkdirp(pindir);
+
+	/*
+	 * The rumble map gets its own pin next to the struct_ops link:
+	 *
+	 *   /sys/fs/bpf/hid/<sysname>/sw001_rumble
+	 */
+	snprintf(mappath, sizeof mappath, "%s/sw001_rumble", pindir);
+
+	/* Remove a stale pin left by a previous instance. */
+	if (unlink(mappath) && errno != ENOENT) {
+		fprintf(stderr, "sw001-bpf-attach: unlink %s failed: %s\n",
+			mappath, strerror(errno));
+		return 1;
+	}
+
+	err = bpf_map__pin(rumble_map, mappath);
+	if (err) {
+		fprintf(stderr, "sw001-bpf-attach: pin %s failed: %s\n",
+			mappath, strerror(-err));
+		return 1;
+	}
+
+	/* Optional SEC("syscall") probe. The object has one: the rumble
+	 * watchdog's wq callback has no hctx, so it needs the numeric hid id
+	 * captured before any hook runs. */
 	probe = bpf_object__find_program_by_name(obj, "probe");
 	if (probe) {
 		args.hid = hid_id;
@@ -206,30 +281,29 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Pin the link or it dies with this process.  HID-BPF uses
+	/* Pin the link or it dies with this process. HID-BPF uses
 	 * /sys/fs/bpf/hid/<sysname>/<obj>, mirroring udev-hid-bpf.
-	 * sysname: basename of the device path with ':' and '.' -> '_'. */
-	snprintf(pinpath, sizeof pinpath, "%s/", PIN_ROOT);
+	 *
+	 * The per-device directory was already created above for the rumble
+	 * map pin. */
+	snprintf(pinpath, sizeof pinpath, "%s/", pindir);
 	pinlen = strlen(pinpath);
-	base = strrchr(devpath, '/');
-	base = base ? base + 1 : devpath;
-	for (const char *c = base; *c; c++)
-		pinpath[pinlen++] = (*c == ':' || *c == '.') ? '_' : *c;
-	pinpath[pinlen++] = '/';
+
 	/* obj basename minus the .o extension, dots -> '_' */
 	base = strrchr(objfile, '/');
 	base = base ? base + 1 : objfile;
-	for (const char *c = base; *c && strcmp(c, ".o") != 0; c++)
+	for (const char *c = base; *c && strcmp(c, ".o") != 0; c++) {
+		if (pinlen + 2 >= sizeof pinpath) {
+			fprintf(stderr,
+				"sw001-bpf-attach: object pin path is too long\n");
+			return 1;
+		}
 		pinpath[pinlen++] = *c == '.' ? '_' : *c;
+	}
 	pinpath[pinlen] = '\0';
 
-	if (access(BPFFS_ROOT, F_OK)) {
-		if (mount("bpf", BPFFS_ROOT, "bpf", 0, NULL))
-			fprintf(stderr, "sw001-bpf-attach: mount %s failed: %s\n",
-				BPFFS_ROOT, strerror(errno));
-	}
-	/* mkdir the parent of the pin file only; the leaf is created by
-	 * bpf_link__pin(). */
+	/* mkdir the parent of the link pin only; the leaf is created by
+	 * bpf_link__pin(). It already exists from the map pin setup above. */
 	lastslash = 0;
 	for (size_t i = 0; pinpath[i]; i++)
 		if (pinpath[i] == '/')

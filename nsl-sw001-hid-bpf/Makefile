@@ -3,22 +3,7 @@ CLANG_STRIP ?= llvm-strip
 CFLAGS ?= -O2 -Wall
 BPF_CFLAGS ?= -O2 -g -Wall
 
-# Defaults: paced zero stop cascade on (NSL_RUMBLE_STOP_CASCADE=1), 20 zero
-# packets (NSL_RUMBLE_ZERO_TOTAL=20) delivered once per 0x30 tick
-# (NSL_ZEROS_PER_TICK=1): the verified 100% stop profile (~200 ms span).
-# NSL_ZEROS_PER_TICK must stay 1 (per-window latch). Override with
-# `make NSL_RUMBLE_STOP_CASCADE=0` to disable the cascade entirely.
-ifdef NSL_RUMBLE_STOP_CASCADE
-BPF_CFLAGS += -DNSL_RUMBLE_STOP_CASCADE=$(NSL_RUMBLE_STOP_CASCADE)
-endif
-ifdef NSL_ZEROS_PER_TICK
-BPF_CFLAGS += -DNSL_ZEROS_PER_TICK=$(NSL_ZEROS_PER_TICK)
-endif
-ifdef NSL_RUMBLE_ZERO_TOTAL
-BPF_CFLAGS += -DNSL_RUMBLE_ZERO_TOTAL=$(NSL_RUMBLE_ZERO_TOTAL)
-endif
-
-.PHONY: all clean deps inspect install uninstall deck-bundle
+.PHONY: all clean deps inspect install uninstall deck-bundle check-kfuncs
 
 all: nsl-sw001.bpf.o
 
@@ -33,6 +18,11 @@ deps:
 	@echo "toolchain ok (no bpftool needed)"
 
 tools/gen_vmlinux_h: tools/gen_vmlinux_h.c
+	$(CC) $(CFLAGS) -o $@ $< -lbpf
+
+# Is a kfunc callable on THIS kernel? See the comment at the top of the source
+# for why a declared kfunc can still be unloadable.
+tools/protodump: tools/protodump.c
 	$(CC) $(CFLAGS) -o $@ $< -lbpf
 
 vmlinux.h: tools/gen_vmlinux_h
@@ -105,5 +95,21 @@ deck-bundle: nsl-sw001.bpf.o $(DECK_ELF_LIBS)
 	@echo "--- deck bundle ready in $(DECK_DIR)/: sw001-bpf-attach (statically linked) + nsl-sw001.bpf.o"
 
 clean:
-	rm -f nsl-sw001.bpf.o vmlinux.h tools/gen_vmlinux_h
+	rm -f nsl-sw001.bpf.o vmlinux.h tools/gen_vmlinux_h tools/protodump
 	rm -rf $(DECK_DIR) $(DECK_BUILD)
+
+# Every kfunc this object calls, in one place, so a kernel that exports a
+# placeholder instead of a real prototype is caught here rather than as an
+# unexplained EINVAL at load time.
+KFUNCS := bpf_wq_init bpf_wq_set_callback bpf_wq_start \
+	  bpf_wq_set_callback_impl hid_bpf_get_data hid_bpf_hw_output_report \
+	  hid_bpf_try_input_report hid_bpf_input_report \
+	  hid_bpf_allocate_context hid_bpf_release_context \
+	  bpf_timer_init bpf_timer_set_callback bpf_timer_start
+
+check-kfuncs: tools/protodump
+	@./tools/protodump $(KFUNCS) | tee /tmp/.sw001-kfuncs; \
+	grep -q "not callable" /tmp/.sw001-kfuncs && { \
+		echo "FAIL: a kfunc used by this object is not callable on this kernel"; \
+		rm -f /tmp/.sw001-kfuncs; exit 1; }; \
+	rm -f /tmp/.sw001-kfuncs; echo "all kfuncs callable"
