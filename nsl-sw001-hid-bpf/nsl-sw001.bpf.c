@@ -421,6 +421,29 @@ static int nsl_rumble_wq_cb(void *map, int *key, void *value)
 	return 0;
 }
 
+/*
+ * Setting the workqueue callback is spelled differently across kernels, and
+ * the arity differs too:
+ *
+ *   Linux 7.4 (Fedora):  bpf_wq_set_callback(wq, cb, flags)
+ *   Steam Deck 6.16:     bpf_wq_set_callback_impl(wq, cb, flags, aux)
+ *
+ * Each build resolves exactly one of them, so the wrong name is never
+ * referenced and libbpf cannot fail the load with "kfunc ... is referenced but
+ * wasn't resolved". Build for the Deck with:  make WQ_CB_IMPL=1
+ */
+#ifndef SW001_WQ_CB_IMPL
+#define SW001_WQ_CB_IMPL 0
+#endif
+
+#if SW001_WQ_CB_IMPL
+#define nsl_wq_set_callback(wq, cb, flags) \
+	bpf_wq_set_callback_impl((wq), (cb), (flags), NULL)
+#else
+#define nsl_wq_set_callback(wq, cb, flags) \
+	bpf_wq_set_callback((wq), (cb), (flags))
+#endif
+
 /* Lazily initialize the timer/workqueue the first time a rumble report for
  * the clone passes through. Keeping initialization here avoids requiring a
  * separate userspace SEC("syscall") initializer. */
@@ -436,7 +459,7 @@ static __always_inline int nsl_rumble_init(struct rumble_state *st,
 		if (ret && ret != -EBUSY)
 			return ret;
 
-		ret = bpf_wq_set_callback(&st->wq, nsl_rumble_wq_cb, 0);
+		ret = nsl_wq_set_callback(&st->wq, nsl_rumble_wq_cb, 0);
 		if (ret)
 			return ret;
 

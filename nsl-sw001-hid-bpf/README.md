@@ -186,6 +186,98 @@ factory IMU calibration (gyro scale 15335, from the faked `0x6020` read),
 
 ## Build
 
+### Kernel portability (`WQ_CB_IMPL`)
+
+The workqueue callback setter is named **and signed differently** on the two
+targets, and referencing the one a kernel lacks fails the whole load with
+`kfunc '...' is referenced but wasn't resolved` before the verifier runs:
+
+| kernel | kfunc | arity |
+|---|---|---|
+| Linux 7.4 (Fedora) | `bpf_wq_set_callback(wq, cb, flags)` | 3 |
+| Steam Deck, Linux 6.16 | `bpf_wq_set_callback_impl(wq, cb, flags, aux)` | 4 |
+
+So the name is a build-time choice, defaulting to 7.4:
+
+```
+make                     # Linux 7.4 (default, WQ_CB_IMPL=0)
+make WQ_CB_IMPL=1        # Steam Deck / Linux 6.16
+```
+
+`nsl_wq_set_callback()` in the source resolves to exactly one of the two per
+build, so the absent name is never referenced. `make check-kfuncs` follows the
+switch too and only checks the kfunc the current build actually uses — and note
+that check is advisory (see above); **the load is the ground truth.**
+
+`make deck-bundle` sets `WQ_CB_IMPL=1` for you, so the bundle always targets the
+Deck without a remembered flag. Because `WQ_CB_IMPL` is a Make variable and not a
+file, make cannot see it change, so the object has a `FORCE` prerequisite and is
+always recompiled (~1s, `vmlinux.h` stays cached). That way a 7.4 object can
+never be served to the Deck or an `_impl` object to 7.4. The target echoes the
+kfunc it settled on before packing:
+
+```
+make deck-bundle
+...
+--- bundle object uses: bpf_wq_set_callback_impl
+```
+
+A clean build for each target is verified by the object referencing one name
+and not the other:
+
+```
+make WQ_CB_IMPL=1 && strings nsl-sw001.bpf.o | grep -c bpf_wq_set_callback_impl   # 2, plain absent
+```
+
+### Cross-building `vmlinux.h` (BTF=)
+
+**You probably don't need a 6.16 header.** Almost everything here relocates by
+CO-RE, and the whole vmlinux.h surface is three field accesses:
+
+| access | relocates against |
+|---|---|
+| `hctx->size` | `struct hid_bpf_ctx` (retval/size union) |
+| `hctx->hid` | `struct hid_bpf_ctx` |
+| `hctx->hid->id` | `struct hid_device` |
+
+`struct hid_bpf_ctx` and the `hid`/`id` fields have been unchanged since HID-BPF
+landed, so a 7.x header relocates onto 6.16 by name without trouble.
+
+`struct bpf_wq` and `struct bpf_timer` are *not* a dependency: vmlinux.h declares
+them as `__u64 __opaque[2]` (16 bytes) and the program only takes their address
+to pass to `bpf_wq_init()` / `bpf_timer_init()`. No field is ever read, so no
+relocation is emitted and the 16-byte size is the same in every kernel.
+
+That leaves the kfunc *name* as the one thing that does not CO-RE — which is
+exactly what `WQ_CB_IMPL` exists for. So: build the bundle normally, try the load,
+and only reach for a target header if the load actually complains about a
+relocation.
+
+If you do want one, `vmlinux.h` is generated from BTF and takes a path. With no
+argument the generator reads the **running** kernel's
+`/sys/kernel/btf/vmlinux`, so building on 7.2 produces a 7.2 header. To build
+against the Deck's instead:
+
+```
+# on the Deck (SteamOS 6.16)
+sudo cp /sys/kernel/btf/vmlinux ~/vmlinux.deck.6.16
+
+# on the build host
+make deck-bundle BTF=~/vmlinux.deck.6.16
+```
+
+Note there is no easily reachable *public* package mirror for Valve's 6.16
+`linux-steamdeck` (Valve's Holo repos are not anonymously listable, and the
+`steamdeck-packages.steamos.cloud` mirror only carries stock Arch `linux` 6.0.2),
+so in practice this route still means fetching it from the Deck. Use the
+`/sys/kernel/btf/vmlinux` copy above when you get one.
+
+Other kernel differences are not switched: the `bpf_timer_*` kfuncs, the
+`hid_bpf_*` helpers and the struct_ops members are the same on both. If a
+future kernel needs another variant, add it alongside `WQ_CB_IMPL` in the
+Makefile and the `#if` in `nsl_wq_set_callback()` rather than forking the
+source.
+
 Needs only clang/llvm for the BPF target, libbpf + gcc for the vmlinux.h
 generator, and the already-installed `udev-hid-bpf` loader. **bpftool is not
 required** — `vmlinux.h` is produced by `tools/gen_vmlinux_h.c`, a ~50-line

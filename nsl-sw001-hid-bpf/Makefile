@@ -3,6 +3,21 @@ CLANG_STRIP ?= llvm-strip
 CFLAGS ?= -O2 -Wall
 BPF_CFLAGS ?= -O2 -g -Wall
 
+# Kernel portability: the workqueue callback setter is named and signed
+# differently on the two targets, so pick the spelling this build targets.
+#   WQ_CB_IMPL=0 (default) -> bpf_wq_set_callback(wq, cb, flags)   Linux 7.4
+#   WQ_CB_IMPL=1           -> bpf_wq_set_callback_impl(wq, cb, flags, aux)
+#                            Steam Deck, Linux 6.16
+# Referencing the other name would fail the load with
+# "kfunc '...' is referenced but wasn't resolved", so the choice must be exact.
+WQ_CB_IMPL ?= 0
+ifeq ($(WQ_CB_IMPL),1)
+WQ_CB_KFUNC := bpf_wq_set_callback_impl
+else
+WQ_CB_KFUNC := bpf_wq_set_callback
+endif
+BPF_CFLAGS += -DSW001_WQ_CB_IMPL=$(WQ_CB_IMPL)
+
 .PHONY: all clean deps inspect install uninstall deck-bundle check-kfuncs
 
 all: nsl-sw001.bpf.o
@@ -25,12 +40,23 @@ tools/gen_vmlinux_h: tools/gen_vmlinux_h.c
 tools/protodump: tools/protodump.c
 	$(CC) $(CFLAGS) -o $@ $< -lbpf
 
-vmlinux.h: tools/gen_vmlinux_h
-	./$< > $@
+# vmlinux.h is generated from BTF. By default that is the running kernel's; set
+# BTF=<path> to cross-build for another kernel, e.g. a copy of the Steam Deck's
+#   sudo cp /sys/kernel/btf/vmlinux ./vmlinux.deck.6.16    (run on the Deck)
+#   make BTF=./vmlinux.deck.6.16 WQ_CB_IMPL=1
+BTF ?= /sys/kernel/btf/vmlinux
 
-nsl-sw001.bpf.o: nsl-sw001.bpf.c vmlinux.h vendor/hid_bpf.h vendor/hid_bpf_helpers.h vendor/hid_report_descriptor_helpers.h
+vmlinux.h: tools/gen_vmlinux_h
+	./$< $(BTF) > $@
+
+# FORCE because WQ_CB_IMPL is a Make variable, not a file: make cannot see it
+# change, so without this a 7.4 object would be served to the Deck and vice
+# versa. The compile is ~1s; vmlinux.h above stays cached.
+.PHONY: FORCE
+
+nsl-sw001.bpf.o: FORCE nsl-sw001.bpf.c vmlinux.h vendor/hid_bpf.h vendor/hid_bpf_helpers.h vendor/hid_report_descriptor_helpers.h
 	$(CLANG) $(BPF_CFLAGS) -target bpf -D__TARGET_ARCH_x86 \
-		-Ivendor -I. -c $< -o $@
+		-Ivendor -I. -c nsl-sw001.bpf.c -o $@
 	$(CLANG_STRIP) -g $@
 
 inspect: nsl-sw001.bpf.o
@@ -81,11 +107,15 @@ $(DECK_ELF_LIBS): | $(DECK_BUILD)
 	cp $(DECK_BUILD)/elfutils-0.193/libelf/libelf.a $(DECK_ELF)/libelf/
 	cp $(DECK_BUILD)/elfutils-0.193/lib/libeu.a $(DECK_ELF)/lib/
 
-deck-bundle: nsl-sw001.bpf.o $(DECK_ELF_LIBS)
+deck-bundle: $(DECK_ELF_LIBS)
 	@test -f /usr/lib64/libc.a || { echo "MISSING: glibc-static (sudo dnf install glibc-static)"; exit 1; }
 	@test -f /usr/lib64/libbpf.a || { echo "MISSING: libbpf-static (sudo dnf install libbpf-static)"; exit 1; }
 	@test -f /usr/lib64/libz.a || { echo "MISSING: zlib-ng-compat-static"; exit 1; }
-	@test -f /usr/lib64/libzstd.a || { echo "MISSING: libzstd-static"; exit 1; }
+	@test -f /usr/lib64/libzstd.a || { echo "MISSING: zstd-static"; exit 1; }
+	@# The Deck is Linux 6.16, which only has bpf_wq_set_callback_impl. The
+	@# object always rebuilds (FORCE), so no stale 7.4 object can leak in.
+	$(MAKE) WQ_CB_IMPL=1 nsl-sw001.bpf.o
+	@echo "--- bundle object uses: $$(strings nsl-sw001.bpf.o | grep -o 'bpf_wq_set_callback[_a-z]*' | sort -u | tr '\n' ' ')"
 	mkdir -p $(DECK_DIR)
 	$(CC) $(CFLAGS) -s -static -no-pie -o $(DECK_DIR)/sw001-bpf-attach $(DECK_LOADER) \
 		-lbpf $(DECK_ELF)/libelf/libelf.a $(DECK_ELF)/lib/libeu.a \
@@ -101,8 +131,8 @@ clean:
 # Every kfunc this object calls, in one place, so a kernel that exports a
 # placeholder instead of a real prototype is caught here rather than as an
 # unexplained EINVAL at load time.
-KFUNCS := bpf_wq_init bpf_wq_set_callback bpf_wq_start \
-	  bpf_wq_set_callback_impl hid_bpf_get_data hid_bpf_hw_output_report \
+KFUNCS := bpf_wq_init $(WQ_CB_KFUNC) bpf_wq_start \
+	  hid_bpf_get_data hid_bpf_hw_output_report \
 	  hid_bpf_try_input_report hid_bpf_input_report \
 	  hid_bpf_allocate_context hid_bpf_release_context \
 	  bpf_timer_init bpf_timer_set_callback bpf_timer_start

@@ -10,15 +10,19 @@ static void printf_cb(void *ctx, const char *fmt, va_list args)
 	vprintf(fmt, args);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	struct btf *btf;
 	struct btf_dump *d;
+	const char *path = argc > 1 ? argv[1] : "/sys/kernel/btf/vmlinux";
 	int err, i, n;
 
-	btf = btf__load_vmlinux_btf();
+	/* With no argument this is the running kernel's BTF. Pass a path to
+	 * cross-build, e.g. a copy of the Steam Deck's /sys/kernel/btf/vmlinux
+	 * (Linux 6.16), so the object matches the kernel it will load on. */
+	btf = btf__parse(path, NULL);
 	if (!btf) {
-		fprintf(stderr, "failed to load /sys/kernel/btf/vmlinux\n");
+		fprintf(stderr, "failed to load BTF from %s\n", path);
 		return 1;
 	}
 
